@@ -33,18 +33,73 @@ st.markdown(
 
 with st.sidebar:
     st.header("Configuration")
-    asset_a = st.selectbox("Asset A", DEFAULT_TICKERS, index=0)
-    asset_b = st.selectbox("Asset B", DEFAULT_TICKERS, index=1)
-    benchmark = st.selectbox("Benchmark", BENCHMARKS, index=0)
+    asset_a = st.selectbox(
+        "Asset A",
+        DEFAULT_TICKERS,
+        index=0,
+        help="Select the first asset in the pairs trading pair.",
+    )
+    asset_b = st.selectbox(
+        "Asset B",
+        DEFAULT_TICKERS,
+        index=1,
+        help="Select the second asset in the pairs trading pair.",
+    )
+    benchmark = st.selectbox(
+        "Benchmark",
+        BENCHMARKS,
+        index=0,
+        help="Choose a benchmark to compute beta exposure and compare strategy performance.",
+    )
 
     st.subheader("Backtest Parameters")
-    start_date = st.date_input("Start Date", date.today() - timedelta(days=365 * 2))
-    end_date = st.date_input("End Date", date.today())
-    lookback = st.slider("Lookback Period (formation)", min_value=20, max_value=180, value=60, step=10)
-    entry_z = st.slider("Entry Z-Score", min_value=1.0, max_value=4.0, value=2.0, step=0.1)
-    exit_z = st.slider("Exit Z-Score", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
-    stop_loss = st.slider("Stop-Loss Z-Score", min_value=1.0, max_value=5.0, value=3.0, step=0.1)
-    hedge_method = st.selectbox("Hedge Ratio Method", HEDGE_METHODS)
+    start_date = st.date_input(
+        "Start Date",
+        date.today() - timedelta(days=365 * 2),
+        help="Select the beginning of the historical window for the backtest.",
+    )
+    end_date = st.date_input(
+        "End Date",
+        date.today(),
+        help="Select the end of the historical window for the backtest.",
+    )
+    lookback = st.slider(
+        "Lookback Period (formation)",
+        min_value=20,
+        max_value=180,
+        value=60,
+        step=10,
+        help="The lookback window used to estimate the spread mean, standard deviation, and rolling hedge ratio.",
+    )
+    entry_z = st.slider(
+        "Entry Z-Score",
+        min_value=1.0,
+        max_value=4.0,
+        value=2.0,
+        step=0.1,
+        help="The z-score threshold at which the strategy enters a long or short pair trade.",
+    )
+    exit_z = st.slider(
+        "Exit Z-Score",
+        min_value=0.1,
+        max_value=2.0,
+        value=0.5,
+        step=0.1,
+        help="The z-score threshold at which the strategy exits the position back to neutral.",
+    )
+    stop_loss = st.slider(
+        "Stop-Loss Z-Score",
+        min_value=1.0,
+        max_value=5.0,
+        value=3.0,
+        step=0.1,
+        help="The z-score level at which the strategy closes the position to limit losses.",
+    )
+    hedge_method = st.selectbox(
+        "Hedge Ratio Method",
+        HEDGE_METHODS,
+        help="Choose between static OLS, rolling regression, or a Kalman Filter for dynamic hedge ratio estimation.",
+    )
 
     if asset_a == asset_b:
         st.error("Please choose two different assets for the pair.")
