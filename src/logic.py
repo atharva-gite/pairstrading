@@ -28,7 +28,7 @@ def check_cointegration(series_a: pd.Series, series_b: pd.Series) -> dict:
     intercept = float(model.params["const"])
     spread = a - (hedge_ratio * b + intercept)
 
-    score, p_value, _ = coint(series_a, series_b)
+    score, p_value, _ = coint(a, b)
     adf_result = adfuller(spread.dropna())
     adf_stat = float(adf_result[0])
     adf_p = float(adf_result[1])
@@ -253,12 +253,13 @@ class PairsTradingEngine:
         log_b = log_price(closes[self.asset_b])
         log_benchmark = log_price(benchmark)
 
+        cointegration = check_cointegration(log_a, log_b)
+
         if self.hedge_method == "Kalman Filter":
             beta, alpha = apply_kalman_filter(log_a, log_b)
         elif self.hedge_method == "Rolling OLS":
             beta, alpha = rolling_ols_hedge_ratio(log_a, log_b, window=self.lookback)
         else:
-            cointegration = check_cointegration(log_a, log_b)
             beta = pd.Series(np.full(len(log_a), cointegration["hedge_ratio"]), index=log_a.index)
             alpha = pd.Series(np.full(len(log_a), cointegration["intercept"]), index=log_a.index)
 
