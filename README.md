@@ -1,0 +1,48 @@
+# Pairs Trading Statistical Arbitrage Engine
+
+This repository contains a professional-grade Streamlit web app for pairs trading using the Engle-Granger two-step methodology and beta-neutral risk analysis.
+
+## Project Structure
+
+- `app.py` - Streamlit application frontend and dashboard layout.
+- `src/logic.py` - Quantitative backend with cointegration, ADF, hedge ratio estimation, signal generation, and backtest logic.
+- `requirements.txt` - Python dependencies.
+- `tests/test_logic.py` - Unit tests for the core quant logic.
+
+## Installation
+
+1. Create a Python virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+2. Install dependencies:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+## Run the App
+
+Start the Streamlit app from the repository root:
+
+```bash
+streamlit run app.py
+```
+
+Open the URL shown in the terminal to use the web dashboard.
+
+## Usage
+
+- Select Asset A and Asset B from the sidebar.
+- Choose a benchmark such as `SPY` or `XLK`.
+- Adjust lookback period, entry/exit z-score, and stop-loss values.
+- Run the backtest to view metrics, cointegration status, and interactive charts.
+
+## Notes
+
+- The app calculates all spread and return values using log prices.
+- Hedge ratio methods include `Static OLS`, `Rolling OLS`, and `Kalman Filter`.
+- Trade execution accounts for 0.1% slippage and fixed commission costs.
