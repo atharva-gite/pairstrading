@@ -18,7 +18,9 @@ def log_price(series: pd.Series) -> pd.Series:
 
 def check_cointegration(series_a: pd.Series, series_b: pd.Series) -> dict:
     a = log_price(series_a).dropna()
+    a.name = series_a.name or "asset_a"
     b = log_price(series_b).reindex(a.index).dropna()
+    b.name = series_b.name or "asset_b"
     a = a.reindex(b.index)
 
     x = sm.add_constant(b)
@@ -60,7 +62,7 @@ def apply_kalman_filter(
     current_state_cov = np.eye(2)
     trans_cov = delta / (1.0 - delta) * np.eye(2)
 
-    obs_mat = np.vstack([x.values, np.ones(n)]).T[:, :, None]
+    obs_mat = np.column_stack([x.values, np.ones(n)])
 
     for t in range(n):
         obs_val = y.values[t]
@@ -71,7 +73,7 @@ def apply_kalman_filter(
         kalman_gain = np.dot(current_state_cov, obs_matrix.T) / innovation_cov
 
         current_state_mean = current_state_mean + (kalman_gain * innovation).flatten()
-        current_state_cov = current_state_cov - np.dot(kalman_gain, np.dot(obs_matrix, current_state_cov))
+        current_state_cov = current_state_cov - np.outer(kalman_gain, np.dot(obs_matrix, current_state_cov))
         current_state_cov = current_state_cov + trans_cov
 
         state_means[t] = current_state_mean
@@ -89,6 +91,7 @@ def rolling_ols_hedge_ratio(
     y = y.dropna()
     x = x.reindex(y.index).dropna()
     x = x.reindex(y.index)
+    x.name = x.name or "x"
 
     betas = [np.nan] * len(y)
     alphas = [np.nan] * len(y)
