@@ -4,8 +4,8 @@ This repository contains a professional-grade Streamlit web app for pairs tradin
 
 ## Project Structure
 
-- `app.py` - Streamlit application frontend and dashboard layout.
-- `src/logic.py` - Quantitative backend with cointegration, ADF, hedge ratio estimation, signal generation, and backtest logic.
+- `app.py` - Streamlit application frontend, sector screener, and dashboard layout.
+- `src/logic.py` - Quantitative backend with pair screening, cointegration, ADF, hedge ratio estimation, dollar-book sizing, signal generation, and backtest logic.
 - `requirements.txt` - Python dependencies.
 - `tests/test_logic.py` - Unit tests for the core quant logic.
 
@@ -36,13 +36,16 @@ Open the URL shown in the terminal to use the web dashboard.
 
 ## Usage
 
-- Select Asset A and Asset B from the sidebar.
+- Select Asset A and Asset B from the sidebar, or load a pair from the Pair Screener tab.
+- Choose a sector universe (Energy, Consumer Staples, Technology, Financials, Healthcare) and screen every pair with Engle-Granger.
 - Choose a benchmark such as `SPY` or `XLK`.
+- Set the dollar book and hedge-ratio vs equal-dollar sizing.
 - Adjust lookback period, entry/exit z-score, and stop-loss values.
-- Run the backtest to view metrics, cointegration status, and interactive charts.
+- Run the backtest to view metrics, cointegration status, spread/z-score charts, trade markers, and PnL vs buy-and-hold.
 
 ## Notes
 
 - The app calculates all spread and return values using log prices.
 - Hedge ratio methods include `Static OLS`, `Rolling OLS`, and `Kalman Filter`.
-- Trade execution accounts for 0.1% slippage and fixed commission costs.
+- Hedge-ratio sizing splits gross capital as $|A| + |\beta| \times |A| = \text{capital}$. Equal-dollar puts the same notional on each leg.
+- Trade execution charges 0.1% slippage and 0.05% commission on traded dollar notional.

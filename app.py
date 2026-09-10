@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from src.logic import PairsTradingEngine
+from src.logic import PairsTradingEngine, SECTOR_UNIVERSES, download_price_data, screen_sector_pairs
 
 TICKER_NAMES = {
     "AAPL": "Apple",
@@ -19,12 +19,31 @@ TICKER_NAMES = {
     "AMD": "Advanced Micro Devices",
     "TSLA": "Tesla",
     "XOM": "Exxon Mobil",
+    "CVX": "Chevron",
+    "COP": "ConocoPhillips",
+    "BP": "BP",
+    "SHEL": "Shell",
+    "KO": "Coca-Cola",
+    "PEP": "PepsiCo",
+    "PG": "Procter & Gamble",
+    "WMT": "Walmart",
+    "COST": "Costco",
     "JNJ": "Johnson & Johnson",
+    "PFE": "Pfizer",
+    "UNH": "UnitedHealth",
+    "ABBV": "AbbVie",
+    "MRK": "Merck",
     "JPM": "JPMorgan Chase",
+    "BAC": "Bank of America",
+    "WFC": "Wells Fargo",
+    "GS": "Goldman Sachs",
+    "MS": "Morgan Stanley",
 }
 DEFAULT_TICKERS = list(TICKER_NAMES.keys())
 BENCHMARKS = ["SPY", "QQQ", "DIA", "IWM", "XLK"]
 HEDGE_METHODS = ["Static OLS", "Rolling OLS", "Kalman Filter"]
+SIZING_METHODS = ["Hedge Ratio", "Equal Dollar"]
+SECTOR_NAMES = list(SECTOR_UNIVERSES.keys())
 
 HEDGE_METHOD_DESCRIPTIONS = {
     "Static OLS": "Uses a fixed historical hedge ratio for the sample period, making execution simpler for stable cointegrated pairs.",
@@ -58,7 +77,7 @@ def build_contextual_system_prompt(metrics: dict | None) -> str:
 
     p_value_text = "not available" if p_value is None else f"{p_value:.4f}"
     sharpe_text = "not available" if sharpe is None else f"{sharpe:.2f}"
-    half_life_text = "not available" if half_life is None else f"{half_life:.1f}"
+    half_life_text = "not available" if half_life is None or pd.isna(half_life) else f"{half_life:.1f}"
     beta_text = "not available" if beta_ratio is None else f"{beta_ratio:.3f}"
 
     return (
@@ -123,16 +142,72 @@ def fallback_ai_reply(user_message: str, system_prompt: str) -> str:
     )
 
 
-def build_price_chart(log_prices: pd.DataFrame, asset_a: str, asset_b: str) -> go.Figure:
+def ticker_label(ticker: str) -> str:
+    name = TICKER_NAMES.get(ticker, ticker)
+    return f"{ticker} ({name})" if name != ticker else ticker
+
+
+def ticker_from_label(label: str) -> str:
+    return label.split(" ")[0]
+
+
+def trade_markers(positions: pd.Series) -> dict[str, pd.Series]:
+    previous = positions.shift(1).fillna(0.0)
+    return {
+        "long_entry": positions[(positions == 1) & (previous != 1)],
+        "short_entry": positions[(positions == -1) & (previous != -1)],
+        "exit": positions[(positions == 0) & (previous != 0)],
+    }
+
+
+def build_price_chart(
+    log_prices: pd.DataFrame,
+    asset_a: str,
+    asset_b: str,
+    positions: pd.Series | None = None,
+) -> go.Figure:
     normalized = np.exp(log_prices.subtract(log_prices.iloc[0]))
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=normalized.index, y=normalized[asset_a], name=asset_a, line=dict(width=2)))
     fig.add_trace(go.Scatter(x=normalized.index, y=normalized[asset_b], name=asset_b, line=dict(width=2)))
+    if positions is not None and not positions.empty:
+        marks = trade_markers(positions)
+        price_a = normalized[asset_a]
+        marker_specs = [
+            ("long_entry", "triangle-up", "green", "Long spread"),
+            ("short_entry", "triangle-down", "red", "Short spread"),
+            ("exit", "x", "gray", "Exit"),
+        ]
+        for key, symbol, color, label in marker_specs:
+            idx = marks[key].index.intersection(price_a.index)
+            if len(idx) == 0:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=idx,
+                    y=price_a.loc[idx],
+                    mode="markers",
+                    name=label,
+                    marker=dict(symbol=symbol, size=11, color=color),
+                )
+            )
     fig.update_layout(
-        title="Normalized Price Comparison (Log Scale)",
+        title="Normalized Prices with Trade Entries and Exits",
         yaxis_title="Normalized Price",
         yaxis_type="log",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_white",
+    )
+    return fig
+
+
+def build_spread_chart(spread: pd.Series, spread_mean: pd.Series) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=spread.index, y=spread, name="Spread", line=dict(color="#0055AA", width=2)))
+    fig.add_trace(go.Scatter(x=spread_mean.index, y=spread_mean, name="Rolling Mean", line=dict(color="#FF7F0E", width=1.5)))
+    fig.update_layout(
+        title="Mean-Reverting Spread",
+        yaxis_title="Log-Price Spread",
         template="plotly_white",
     )
     return fig
@@ -155,12 +230,39 @@ def build_zscore_chart(zscore: pd.Series, entry_z: float, exit_z: float, stop_lo
     return fig
 
 
-def build_returns_chart(strategy_returns: pd.Series, benchmark_cumulative: pd.Series, benchmark_name: str) -> go.Figure:
+def build_returns_chart(
+    strategy_returns: pd.Series,
+    benchmark_cumulative: pd.Series,
+    pair_buy_hold_cumulative: pd.Series,
+    benchmark_name: str,
+) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=strategy_returns.index, y=np.exp(strategy_returns.cumsum()) - 1.0, name="Strategy", line=dict(color="#1F77B4")))
-    fig.add_trace(go.Scatter(x=benchmark_cumulative.index, y=benchmark_cumulative, name=f"{benchmark_name} Buy & Hold", line=dict(color="#FF7F0E")))
+    fig.add_trace(
+        go.Scatter(
+            x=strategy_returns.index,
+            y=np.exp(strategy_returns.cumsum()) - 1.0,
+            name="Pairs Strategy",
+            line=dict(color="#1F77B4"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=pair_buy_hold_cumulative.index,
+            y=pair_buy_hold_cumulative,
+            name="Pair Buy & Hold",
+            line=dict(color="#2CA02C"),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=benchmark_cumulative.index,
+            y=benchmark_cumulative,
+            name=f"{benchmark_name} Buy & Hold",
+            line=dict(color="#FF7F0E"),
+        )
+    )
     fig.update_layout(
-        title="Cumulative Strategy Returns vs Benchmark",
+        title="Cumulative PnL vs Pair Buy-and-Hold and Benchmark",
         yaxis_title="Cumulative Return",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         template="plotly_white",
@@ -190,23 +292,23 @@ with st.sidebar:
         )
         st.caption("These answers are surfaced in the AI Quant Assistant tab below using the latest backtest context.")
 
-    asset_labels = [f"{ticker} ({TICKER_NAMES[ticker]})" for ticker in DEFAULT_TICKERS]
+    asset_labels = [ticker_label(ticker) for ticker in DEFAULT_TICKERS]
     asset_a_label = st.selectbox(
         "Asset A",
         asset_labels,
         index=0,
         key="asset_a",
-        help="Select the first asset in the pair. The app will use the ticker symbol for quant calculations.",
+        help="Select the first asset in the pair. Load a candidate from the Pair Screener tab to populate this.",
     )
     asset_b_label = st.selectbox(
         "Asset B",
         asset_labels,
         index=1,
         key="asset_b",
-        help="Select the second asset in the pair. Choose a correlated instrument for mean-reversion analysis.",
+        help="Select the second asset in the pair. Choose a cointegrated instrument from the same sector when possible.",
     )
-    asset_a = asset_a_label.split(" ")[0]
-    asset_b = asset_b_label.split(" ")[0]
+    asset_a = ticker_from_label(asset_a_label)
+    asset_b = ticker_from_label(asset_b_label)
 
     benchmark = st.selectbox(
         "Benchmark",
@@ -275,9 +377,25 @@ with st.sidebar:
     )
     st.caption(HEDGE_METHOD_DESCRIPTIONS.get(hedge_method, ""))
 
+    capital = st.number_input(
+        "Dollar Book ($)",
+        min_value=10_000.0,
+        max_value=10_000_000.0,
+        value=100_000.0,
+        step=10_000.0,
+        key="capital",
+        help="Gross dollar capital allocated to the pair. Hedge-ratio sizing splits this as $A + $|beta| A = capital.",
+    )
+    sizing_method = st.selectbox(
+        "Position Sizing",
+        SIZING_METHODS,
+        key="sizing_method",
+        help="Hedge Ratio sizes B to the OLS/Kalman beta. Equal Dollar puts the same notional on each leg.",
+    )
+
     st.markdown("---")
     st.write("**Execution assumptions**")
-    st.caption("Slippage = 0.1%, commission = 0.05% per side, based on log-price returns.")
+    st.caption("Slippage = 0.1%, commission = 0.05% of traded dollar notional per side.")
     run_button = st.button("Run Backtest")
 
 if "ai_messages" not in st.session_state:
@@ -286,9 +404,9 @@ if "ai_messages" not in st.session_state:
 if asset_a == asset_b:
     st.sidebar.error("Asset A and Asset B must be different.")
 
-result = None
-metrics = None
-show_results = False
+result = st.session_state.get("latest_backtest")
+metrics = None if result is None else result.get("metrics")
+show_results = bool(result) and not result["data"].empty
 
 if run_button and asset_a != asset_b and start_date < end_date:
     with st.spinner("Running the quant engine..."):
@@ -305,93 +423,189 @@ if run_button and asset_a != asset_b and start_date < end_date:
             slippage=0.001,
             commission=0.0005,
             hedge_method=hedge_method,
+            capital=float(capital),
+            sizing_method=sizing_method,
         )
         result = engine.fetch().run_backtest()
 
+    st.session_state["latest_backtest"] = result
     st.session_state["latest_backtest_metrics"] = result["metrics"]
     st.session_state["assistant_system_prompt"] = build_contextual_system_prompt(result["metrics"])
 
     if result["data"].empty:
         st.error("No historical data loaded for the selected symbols and date range.")
+        show_results = False
+        metrics = None
     else:
         metrics = result["metrics"]
         show_results = True
 
 st.markdown("---")
-main_tabs = st.tabs(["Strategy Setup", "Performance", "Diagnostics", "Charts", "AI Quant Assistant"])
+main_tabs = st.tabs(["Pair Screener", "Strategy Setup", "Performance", "Diagnostics", "Charts", "AI Quant Assistant"])
 
 with main_tabs[0]:
+    st.markdown("### Sector Pair Screener")
+    st.markdown(
+        "Download a sector universe from Yahoo Finance, run Engle-Granger on every unique pair, "
+        "and rank by cointegration p-value and half-life. Load a candidate into the sidebar, then run the backtest."
+    )
+    screen_cols = st.columns([2, 1, 1])
+    with screen_cols[0]:
+        sector = st.selectbox("Sector Universe", SECTOR_NAMES, key="screen_sector")
+    with screen_cols[1]:
+        p_threshold = st.number_input(
+            "p-value cutoff",
+            min_value=0.01,
+            max_value=0.20,
+            value=0.05,
+            step=0.01,
+            key="screen_p_value",
+        )
+    with screen_cols[2]:
+        st.write("")
+        st.write("")
+        run_screen = st.button("Screen Sector", type="primary")
+
+    st.caption("Universe: " + ", ".join(SECTOR_UNIVERSES[sector]))
+
+    if run_screen:
+        with st.spinner(f"Screening {sector} pairs..."):
+            sector_prices = download_price_data(
+                SECTOR_UNIVERSES[sector],
+                start_date.isoformat(),
+                end_date.isoformat(),
+            )
+            screen_table = screen_sector_pairs(sector_prices, p_value_threshold=float(p_threshold))
+        st.session_state["screen_table"] = screen_table
+        st.session_state["screen_sector_used"] = sector
+
+    screen_table = st.session_state.get("screen_table")
+    if screen_table is None:
+        st.info("Choose a sector and click Screen Sector. Classic examples: Energy (XOM/CVX), Consumer Staples (KO/PEP).")
+    elif screen_table.empty:
+        st.warning("No pairs could be tested for this universe and date range.")
+    else:
+        n_coint = int(screen_table["cointegrated"].sum())
+        st.success(f"{len(screen_table)} pairs tested, {n_coint} below the p-value cutoff.")
+        display = screen_table.copy()
+        display["p_value"] = display["p_value"].map(lambda x: f"{x:.4f}")
+        display["adf_p_value"] = display["adf_p_value"].map(lambda x: f"{x:.4f}")
+        display["hedge_ratio"] = display["hedge_ratio"].map(lambda x: f"{x:.3f}")
+        display["half_life"] = display["half_life"].map(lambda x: "n/a" if pd.isna(x) else f"{x:.1f}")
+        st.dataframe(
+            display[["pair", "p_value", "adf_p_value", "hedge_ratio", "half_life", "cointegrated"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+        pair_options = screen_table["pair"].tolist()
+        chosen_pair = st.selectbox("Load candidate into the engine", pair_options, key="screen_pair_choice")
+        if st.button("Use Selected Pair"):
+            chosen_a, chosen_b = chosen_pair.split("/")
+            st.session_state["asset_a"] = ticker_label(chosen_a)
+            st.session_state["asset_b"] = ticker_label(chosen_b)
+            st.rerun()
+
+with main_tabs[1]:
     st.markdown("### Strategy Setup")
     if show_results:
         st.success("Backtest completed. Review the insights in the performance, diagnostics, charts, and assistant tabs.")
     else:
         st.markdown(
-            "This tool is designed to feel engineered, not just plotted. Configure the pair, benchmark, and risk profile, then run the backtest to see a professional-grade results interface."
+            "Screen a sector, load a cointegrated pair, then run a dollar-book long/short backtest with z-score entry and exit rules."
         )
         st.markdown(
-            "- Engle-Granger two-step cointegration testing\n- Beta-neutral factor exposure analysis\n- Static OLS, Rolling OLS, and Kalman Filter hedge ratio methods\n- Tabbed results for overview, diagnostics, and raw outputs"
+            "- Sector pair screening with Engle-Granger tests\n"
+            "- Mean-reverting spread and rolling z-score signals\n"
+            "- Hedge-ratio or equal-dollar position sizing\n"
+            "- Transaction costs, stop-loss, and buy-and-hold comparison"
         )
         hero_cols = st.columns([2, 1])
         with hero_cols[0]:
-            st.info("Fill in the sidebar and click Run Backtest to execute the quant engine.")
+            st.info("Fill in the sidebar and click Run Backtest, or load a pair from the screener first.")
         with hero_cols[1]:
             st.metric("Selected Pair", f"{asset_a} / {asset_b}")
             st.metric("Benchmark", benchmark)
             st.metric("Hedge Method", hedge_method)
-            st.metric("Lookback", f"{lookback} days")
+            st.metric("Dollar Book", f"${capital:,.0f}")
 
-with main_tabs[1]:
+with main_tabs[2]:
     if show_results:
         st.markdown("## Performance Summary")
         perf_cols = st.columns([1, 1, 1, 1])
         perf_cols[0].metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
         perf_cols[1].metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
-        perf_cols[2].metric("Win Rate", f"{metrics['win_rate']:.2%}")
-        perf_cols[3].metric("Half-Life", f"{metrics['half_life']:.1f} days")
+        perf_cols[2].metric("Total Return", f"{metrics['total_return']:.2%}")
+        perf_cols[3].metric("Win Rate", f"{metrics['win_rate']:.2%}")
+        money_cols = st.columns([1, 1, 1, 1])
+        money_cols[0].metric("Starting Capital", f"${metrics['capital']:,.0f}")
+        money_cols[1].metric("Total PnL", f"${metrics['total_pnl']:,.0f}")
+        money_cols[2].metric("Ending Equity", f"${metrics['ending_equity']:,.0f}")
+        money_cols[3].metric(
+            "Half-Life",
+            "n/a" if pd.isna(metrics["half_life"]) else f"{metrics['half_life']:.1f} days",
+        )
+        st.caption(f"Sizing method: {metrics.get('sizing_method', sizing_method)}. Returns are dollar PnL divided by the dollar book.")
     else:
         st.info("Run a backtest to see performance metrics.")
 
-with main_tabs[2]:
+with main_tabs[3]:
     if show_results:
         st.markdown("## Model Diagnostics")
         diag_cols = st.columns([1, 1, 1])
         diag_cols[0].metric("Cointegration", metrics["cointegration_status"], f"p = {metrics['cointegration_p_value']:.4f}")
         diag_cols[1].metric("Beta Ratio", f"{metrics['beta_ratio']:.3f}", f"A: {metrics['benchmark_beta_a']:.3f} / B: {metrics['benchmark_beta_b']:.3f}")
-        diag_cols[2].metric("Hedge Method", hedge_method)
+        diag_cols[2].metric("Hedge Ratio", f"{metrics['hedge_ratio']:.3f}")
         st.markdown("### Statistical Details")
         st.write("- Engle-Granger cointegration validates long-term equilibrium between the log-price series.")
-        st.write("- Beta-neutrality compares each asset's market exposure to the benchmark.")
-        st.write("- A low beta ratio indicates closer factor neutrality between the pair and benchmark.")
+        st.write("- Hedge-ratio sizing holds $A and $β of B so the book stays close to spread-neutral.")
         st.write(f"- Cointegration p-value: **{metrics['cointegration_p_value']:.4f}**")
         st.write(f"- Cointegration status: **{metrics['cointegration_status']}**")
         st.write(f"- Beta A vs benchmark: **{metrics['benchmark_beta_a']:.3f}**")
         st.write(f"- Beta B vs benchmark: **{metrics['benchmark_beta_b']:.3f}**")
         st.write(f"- Factor beta ratio: **{metrics['beta_ratio']:.3f}**")
-        st.write(f"- Mean reversion half-life: **{metrics['half_life']:.1f} days**")
+        half_life_text = "n/a" if pd.isna(metrics["half_life"]) else f"{metrics['half_life']:.1f} days"
+        st.write(f"- Mean reversion half-life: **{half_life_text}**")
     else:
         st.info("Run a backtest to inspect the model diagnostics.")
 
-with main_tabs[3]:
+with main_tabs[4]:
     if show_results:
         st.markdown("### Overview Chart")
+        chart_a = result["asset_a"]
+        chart_b = result["asset_b"]
         overview_cols = st.columns([2, 1])
         with overview_cols[0]:
-            st.plotly_chart(build_price_chart(result["log_prices"], asset_a, asset_b), use_container_width=True)
-            st.plotly_chart(build_returns_chart(result["strategy_returns"], result["benchmark_cumulative"], benchmark), use_container_width=True)
+            st.plotly_chart(
+                build_price_chart(result["log_prices"], chart_a, chart_b, result["positions"]),
+                use_container_width=True,
+            )
+            st.plotly_chart(
+                build_spread_chart(result["spread"], result["spread_mean"]),
+                use_container_width=True,
+            )
+            st.plotly_chart(
+                build_returns_chart(
+                    result["strategy_returns"],
+                    result["benchmark_cumulative"],
+                    result["pair_buy_hold_cumulative"],
+                    result["benchmark"],
+                ),
+                use_container_width=True,
+            )
         with overview_cols[1]:
             st.plotly_chart(build_zscore_chart(result["zscore"], entry_z, exit_z, stop_loss), use_container_width=True)
             st.markdown("#### Strategy Configuration")
-            st.write(f"**Pair:** {asset_a} / {asset_b}")
-            st.write(f"**Benchmark:** {benchmark}")
-            st.write(f"**Benchmark Significance:** {BENCHMARK_DESCRIPTIONS.get(benchmark, '')}")
+            st.write(f"**Pair:** {chart_a} / {chart_b}")
+            st.write(f"**Benchmark:** {result['benchmark']}")
             st.write(f"**Lookback:** {lookback} days")
             st.write(f"**Entry:** {entry_z} | Exit: {exit_z} | Stop-Loss: {stop_loss}")
-            st.write(f"**Hedge Method:** {hedge_method}")
-            st.write(f"**Hedge Method Significance:** {HEDGE_METHOD_DESCRIPTIONS.get(hedge_method, '')}")
+            st.write(f"**Hedge Method:** {result['hedge_method']}")
+            st.write(f"**Sizing:** {result['sizing_method']} on a ${metrics['capital']:,.0f} book")
+            st.write("Green triangles: long the spread. Red triangles: short the spread. Gray X: exit.")
     else:
-        st.info("Run a backtest to visualize the pair chart and trade bands.")
+        st.info("Run a backtest to visualize spread, z-score, trade markers, and cumulative PnL.")
 
-with main_tabs[4]:
+with main_tabs[5]:
     if "assistant_system_prompt" not in st.session_state:
         st.session_state["assistant_system_prompt"] = build_contextual_system_prompt(st.session_state.get("latest_backtest_metrics"))
 

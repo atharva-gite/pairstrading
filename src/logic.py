@@ -1,8 +1,29 @@
+from itertools import combinations
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller, coint
+
+SECTOR_UNIVERSES = {
+    "Energy": ["XOM", "CVX", "COP", "BP", "SHEL"],
+    "Consumer Staples": ["KO", "PEP", "PG", "WMT", "COST"],
+    "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMD"],
+    "Financials": ["JPM", "BAC", "WFC", "GS", "MS"],
+    "Healthcare": ["JNJ", "PFE", "UNH", "ABBV", "MRK"],
+}
+
+SCREEN_COLUMNS = [
+    "asset_a",
+    "asset_b",
+    "pair",
+    "p_value",
+    "adf_p_value",
+    "hedge_ratio",
+    "half_life",
+    "cointegrated",
+]
 
 
 def download_price_data(tickers, start, end):
@@ -170,10 +191,10 @@ def compute_beta_ratio(
     combined_b = pd.concat([asset_b_returns, benchmark_returns], axis=1).dropna()
 
     beta_a = float(
-        sm.OLS(combined_a.iloc[:, 0], sm.add_constant(combined_a.iloc[:, 1])).fit().params[1]
+        sm.OLS(combined_a.iloc[:, 0], sm.add_constant(combined_a.iloc[:, 1])).fit().params.iloc[-1]
     )
     beta_b = float(
-        sm.OLS(combined_b.iloc[:, 0], sm.add_constant(combined_b.iloc[:, 1])).fit().params[1]
+        sm.OLS(combined_b.iloc[:, 0], sm.add_constant(combined_b.iloc[:, 1])).fit().params.iloc[-1]
     )
     ratio = float(beta_a / beta_b) if not np.isclose(beta_b, 0.0) else float("nan")
 
@@ -211,6 +232,64 @@ def compute_performance_metrics(returns: pd.Series, positions: pd.Series) -> dic
     }
 
 
+def dollar_notionals(
+    beta: pd.Series,
+    capital: float,
+    sizing_method: str = "Hedge Ratio",
+) -> tuple[pd.Series, pd.Series]:
+    """Map a dollar book to legs A and B.
+
+    Hedge Ratio: gross |A| + |B| = capital, with |B| = |beta| * |A|.
+    Equal Dollar: |A| = |B| = capital / 2, still short B when beta > 0.
+    """
+    abs_beta = beta.abs()
+    if sizing_method == "Equal Dollar":
+        notional_a = pd.Series(capital / 2.0, index=beta.index)
+        notional_b = np.sign(beta.replace(0.0, 1.0)) * (capital / 2.0)
+    else:
+        denom = 1.0 + abs_beta
+        denom = denom.replace(0.0, np.nan)
+        notional_a = capital / denom
+        notional_b = notional_a * beta
+    return notional_a.fillna(0.0), notional_b.fillna(0.0)
+
+
+def screen_sector_pairs(
+    prices: pd.DataFrame,
+    p_value_threshold: float = 0.05,
+) -> pd.DataFrame:
+    """Rank every unique pair in a price panel by Engle-Granger p-value."""
+    tickers = [col for col in prices.columns if prices[col].notna().sum() > 30]
+    rows = []
+    for asset_a, asset_b in combinations(tickers, 2):
+        try:
+            result = check_cointegration(prices[asset_a], prices[asset_b])
+            half_life = calculate_half_life(result["spread"])
+            rows.append(
+                {
+                    "asset_a": asset_a,
+                    "asset_b": asset_b,
+                    "pair": f"{asset_a}/{asset_b}",
+                    "p_value": result["p_value"],
+                    "adf_p_value": result["adf_p_value"],
+                    "hedge_ratio": result["hedge_ratio"],
+                    "half_life": half_life,
+                    "cointegrated": bool(result["p_value"] < p_value_threshold),
+                }
+            )
+        except (ValueError, np.linalg.LinAlgError, KeyError):
+            continue
+
+    if not rows:
+        return pd.DataFrame(columns=SCREEN_COLUMNS)
+
+    ranked = pd.DataFrame(rows)
+    return ranked.sort_values(
+        ["cointegrated", "p_value", "half_life"],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)
+
+
 class PairsTradingEngine:
     def __init__(
         self,
@@ -226,6 +305,8 @@ class PairsTradingEngine:
         slippage: float = 0.001,
         commission: float = 0.0005,
         hedge_method: str = "Static OLS",
+        capital: float = 100_000.0,
+        sizing_method: str = "Hedge Ratio",
     ):
         self.asset_a = asset_a
         self.asset_b = asset_b
@@ -239,6 +320,8 @@ class PairsTradingEngine:
         self.slippage = slippage
         self.commission = commission
         self.hedge_method = hedge_method
+        self.capital = float(capital)
+        self.sizing_method = sizing_method
         self.data = pd.DataFrame()
 
     def fetch(self) -> "PairsTradingEngine":
@@ -256,7 +339,7 @@ class PairsTradingEngine:
         log_b = log_price(closes[self.asset_b])
         log_benchmark = log_price(benchmark)
 
-        cointegration = check_cointegration(log_a, log_b)
+        cointegration = check_cointegration(closes[self.asset_a], closes[self.asset_b])
 
         if self.hedge_method == "Kalman Filter":
             beta, alpha = apply_kalman_filter(log_a, log_b)
@@ -267,21 +350,30 @@ class PairsTradingEngine:
             alpha = pd.Series(np.full(len(log_a), cointegration["intercept"]), index=log_a.index)
 
         spread = log_a - (beta * log_b + alpha)
-        zscore = (spread - spread.rolling(self.lookback).mean()) / spread.rolling(self.lookback).std()
-        zscore = zscore.fillna(0.0)
+        rolling_mean = spread.rolling(self.lookback).mean()
+        rolling_std = spread.rolling(self.lookback).std()
+        zscore = (spread - rolling_mean) / rolling_std
 
         positions = build_signals(zscore, self.entry_z, self.exit_z, self.stop_loss)
-        trades = positions.diff().abs().fillna(0.0)
-        transaction_costs = trades * (self.commission + self.slippage)
 
         returns_a = log_a.diff().fillna(0.0)
         returns_b = log_b.diff().fillna(0.0)
         returns_benchmark = log_benchmark.diff().fillna(0.0)
 
-        beta_prev = beta.shift(1).fillna(method="ffill").fillna(0.0)
-        base_returns = returns_a - beta_prev * returns_b
-        strategy_returns = positions.shift(1).fillna(0.0) * base_returns - transaction_costs
-        strategy_returns = strategy_returns.fillna(0.0)
+        beta_lag = beta.shift(1).ffill().fillna(0.0)
+        notional_a, notional_b = dollar_notionals(beta_lag, self.capital, self.sizing_method)
+        pos_lag = positions.shift(1).fillna(0.0)
+
+        held_a = pos_lag * notional_a
+        held_b = -pos_lag * notional_b
+        dollar_pnl = held_a * returns_a + held_b * returns_b
+
+        turnover = held_a.diff().abs().fillna(held_a.abs()) + held_b.diff().abs().fillna(held_b.abs())
+        transaction_costs = turnover * (self.commission + self.slippage)
+        dollar_pnl = (dollar_pnl - transaction_costs).fillna(0.0)
+
+        strategy_returns = dollar_pnl / self.capital
+        equity = self.capital + dollar_pnl.cumsum()
 
         benchmark_returns = returns_benchmark
         benchmark_cum = np.exp(benchmark_returns.cumsum()) - 1.0
@@ -292,8 +384,6 @@ class PairsTradingEngine:
         beta_ratio_info = compute_beta_ratio(returns_a, returns_b, benchmark_returns)
         performance = compute_performance_metrics(strategy_returns, positions)
         half_life = calculate_half_life(spread)
-
-        cointegration = check_cointegration(closes[self.asset_a], closes[self.asset_b])
         cointegration_status = "Validated" if cointegration["p_value"] < 0.05 else "Not Validated"
 
         return {
@@ -301,6 +391,7 @@ class PairsTradingEngine:
             "asset_b": self.asset_b,
             "benchmark": self.benchmark,
             "hedge_method": self.hedge_method,
+            "sizing_method": self.sizing_method,
             "data": closes,
             "benchmark_series": benchmark,
             "log_prices": pd.DataFrame({
@@ -309,18 +400,28 @@ class PairsTradingEngine:
                 self.benchmark: log_benchmark,
             }),
             "spread": spread,
+            "spread_mean": rolling_mean,
             "zscore": zscore,
             "positions": positions,
+            "notional_a": notional_a,
+            "notional_b": notional_b,
+            "dollar_pnl": dollar_pnl,
+            "equity": equity,
             "strategy_returns": strategy_returns,
             "benchmark_returns": benchmark_returns,
             "benchmark_cumulative": benchmark_cum,
             "pair_buy_hold_cumulative": pair_buy_hold_cum,
             "metrics": {
                 **performance,
+                "capital": self.capital,
+                "sizing_method": self.sizing_method,
+                "total_pnl": float(dollar_pnl.sum()),
+                "ending_equity": float(equity.iloc[-1]) if len(equity) else self.capital,
                 "half_life": half_life,
                 "beta_ratio": beta_ratio_info["beta_ratio"],
                 "benchmark_beta_a": beta_ratio_info["beta_a"],
                 "benchmark_beta_b": beta_ratio_info["beta_b"],
+                "hedge_ratio": cointegration["hedge_ratio"],
                 "cointegration_p_value": cointegration["p_value"],
                 "cointegration_status": cointegration_status,
             },

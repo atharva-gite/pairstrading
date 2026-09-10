@@ -1,6 +1,14 @@
 import numpy as np
 import pandas as pd
-from src.logic import apply_kalman_filter, build_signals, calculate_half_life, check_cointegration
+from src.logic import (
+    PairsTradingEngine,
+    apply_kalman_filter,
+    build_signals,
+    calculate_half_life,
+    check_cointegration,
+    dollar_notionals,
+    screen_sector_pairs,
+)
 
 
 def test_check_cointegration_returns_expected_keys():
@@ -37,3 +45,68 @@ def test_half_life_positive_for_mean_reverting_spread():
     half_life = calculate_half_life(spread)
 
     assert half_life > 0
+
+
+def test_dollar_notionals_hedge_ratio_splits_gross_capital():
+    beta = pd.Series([1.0, 2.0], index=pd.date_range("2020-01-01", periods=2))
+    notional_a, notional_b = dollar_notionals(beta, capital=90_000.0, sizing_method="Hedge Ratio")
+
+    assert np.isclose(notional_a.iloc[0] + abs(notional_b.iloc[0]), 90_000.0)
+    assert np.isclose(notional_a.iloc[1], 30_000.0)
+    assert np.isclose(notional_b.iloc[1], 60_000.0)
+
+
+def test_dollar_notionals_equal_dollar_ignores_beta_magnitude():
+    beta = pd.Series([2.0, -0.5], index=pd.date_range("2020-01-01", periods=2))
+    notional_a, notional_b = dollar_notionals(beta, capital=100_000.0, sizing_method="Equal Dollar")
+
+    assert np.allclose(notional_a, 50_000.0)
+    assert np.isclose(notional_b.iloc[0], 50_000.0)
+    assert np.isclose(notional_b.iloc[1], -50_000.0)
+
+
+def test_screen_sector_pairs_ranks_cointegrated_first():
+    rng = np.random.default_rng(7)
+    dates = pd.date_range("2020-01-01", periods=180)
+    x = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, 180))), index=dates, name="X")
+    y = pd.Series(np.exp(1.1 * np.log(x) + rng.normal(0, 0.005, 180)), index=dates, name="Y")
+    z = pd.Series(50 * np.exp(np.cumsum(rng.normal(0, 0.02, 180))), index=dates, name="Z")
+    ranked = screen_sector_pairs(pd.concat([x, y, z], axis=1), p_value_threshold=0.05)
+
+    assert list(ranked.columns) == [
+        "asset_a",
+        "asset_b",
+        "pair",
+        "p_value",
+        "adf_p_value",
+        "hedge_ratio",
+        "half_life",
+        "cointegrated",
+    ]
+    assert len(ranked) == 3
+    assert ranked.iloc[0]["pair"] in {"X/Y", "Y/X"}
+
+
+def test_run_backtest_uses_dollar_book_and_buy_hold():
+    dates = pd.date_range("2020-01-01", periods=80)
+    asset_a = pd.Series(100 * np.exp(np.linspace(0, 0.08, 80) + 0.02 * np.sin(np.arange(80) / 5)), index=dates)
+    asset_b = asset_a * 0.92 + 4.0
+    spy = asset_a * 1.01
+    engine = PairsTradingEngine(
+        "AAA",
+        "BBB",
+        "SPY",
+        "2020-01-01",
+        "2020-04-20",
+        lookback=20,
+        capital=100_000.0,
+        sizing_method="Hedge Ratio",
+    )
+    engine.data = pd.DataFrame({"AAA": asset_a, "BBB": asset_b, "SPY": spy})
+    result = engine.run_backtest()
+
+    assert "pair_buy_hold_cumulative" in result
+    assert "spread_mean" in result
+    assert np.isclose(result["metrics"]["capital"], 100_000.0)
+    assert result["equity"].iloc[0] != 0
+    assert len(result["positions"]) == 80
