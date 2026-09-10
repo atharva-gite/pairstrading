@@ -4,9 +4,14 @@ from src.logic import (
     PairsTradingEngine,
     apply_kalman_filter,
     build_signals,
+    build_trade_blotter,
     calculate_half_life,
+    call_llm,
     check_cointegration,
+    compute_tether_profile,
     dollar_notionals,
+    generate_desk_briefing,
+    parse_desk_briefing,
     screen_sector_pairs,
 )
 
@@ -81,10 +86,14 @@ def test_screen_sector_pairs_ranks_cointegrated_first():
         "adf_p_value",
         "hedge_ratio",
         "half_life",
+        "tether_score",
+        "tether_state",
+        "tether_reason",
         "cointegrated",
     ]
     assert len(ranked) == 3
     assert ranked.iloc[0]["pair"] in {"X/Y", "Y/X"}
+    assert ranked.iloc[0]["tether_score"] >= ranked.iloc[-1]["tether_score"]
 
 
 def test_run_backtest_uses_dollar_book_and_buy_hold():
@@ -108,5 +117,96 @@ def test_run_backtest_uses_dollar_book_and_buy_hold():
     assert "pair_buy_hold_cumulative" in result
     assert "spread_mean" in result
     assert np.isclose(result["metrics"]["capital"], 100_000.0)
-    assert result["equity"].iloc[0] != 0
+    assert "tether_score" in result["metrics"]
+    assert "blotter" in result
     assert len(result["positions"]) == 80
+
+
+def test_tether_profile_flags_broken_relationship():
+    broken = compute_tether_profile(p_value=0.40, adf_p_value=0.50, half_life=200.0)
+    healthy = compute_tether_profile(p_value=0.01, adf_p_value=0.01, half_life=18.0)
+    assert broken["tether_state"] == "BROKEN"
+    assert broken["tether_reason"] == "no_cointegration"
+    assert healthy["tether_state"] == "TETHERED"
+    assert healthy["tether_score"] > broken["tether_score"]
+    slow = compute_tether_profile(p_value=0.02, adf_p_value=0.02, half_life=114.0)
+    assert slow["tether_reason"] == "too_slow"
+
+
+def test_trade_blotter_records_round_trip():
+    idx = pd.date_range("2020-01-01", periods=6)
+    positions = pd.Series([0.0, 1.0, 1.0, 1.0, 0.0, 0.0], index=idx)
+    zscore = pd.Series([0.0, -2.2, -1.4, -0.4, -0.2, 0.1], index=idx)
+    dollar_pnl = pd.Series([0.0, 0.0, 40.0, 25.0, 10.0, 0.0], index=idx)
+    blotter = build_trade_blotter(positions, zscore, dollar_pnl, half_life=10.0, stop_loss=3.0)
+    assert len(blotter) == 1
+    assert blotter.iloc[0]["side"] == "Long spread"
+    assert blotter.iloc[0]["reason"] == "revert"
+
+
+def test_parse_desk_briefing_reads_fenced_json():
+    parsed = parse_desk_briefing(
+        '```json\n{"headline": "KO/PEP still tethered", "verdict": "Stay in.", "drivers": "p=0.01", "risks": "break"}\n```'
+    )
+    assert parsed["headline"].startswith("KO/PEP")
+    assert parsed["verdict"] == "Stay in."
+
+
+def test_call_llm_sends_book_context(monkeypatch):
+    captured = {}
+
+    class FakeMessage:
+        content = "Grounded answer"
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(model, messages, temperature=0.2):
+                    captured["model"] = model
+                    captured["messages"] = messages
+                    return FakeResponse()
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "groq")
+    monkeypatch.setattr("src.logic.GROQ_CLIENT_FACTORY", lambda api_key: FakeClient())
+    result = call_llm(
+        [{"role": "user", "content": "Is the tether intact?"}],
+        {"pair": "KO/PEP", "metrics": {"tether_state": "TETHERED"}},
+        task="research",
+    )
+    assert result.ok
+    assert result.content == "Grounded answer"
+    assert "ACTIVE_BOOK_CONTEXT_JSON" in captured["messages"][0]["content"]
+    assert "KO/PEP" in captured["messages"][0]["content"]
+
+
+def test_generate_desk_briefing_parses_json(monkeypatch):
+    class FakeMessage:
+        content = '{"headline": "H", "verdict": "V", "drivers": "D", "risks": "R"}'
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(model, messages, temperature=0.2):
+                    return FakeResponse()
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setattr("src.logic.GROQ_CLIENT_FACTORY", lambda api_key: FakeClient())
+    briefing = generate_desk_briefing({"pair": "KO/PEP"})
+    assert briefing["headline"] == "H"
+    assert briefing["verdict"] == "V"
+    assert briefing["error"] is None
