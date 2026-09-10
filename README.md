@@ -1,11 +1,9 @@
-# Pairs Trading Statistical Arbitrage Engine
+# TETHER
 
-This repository contains a professional-grade Streamlit web app for pairs trading using the Engle-Granger two-step methodology and beta-neutral risk analysis.
+Market-neutral pairs desk. Screen a sector, score whether the cointegrating tether is still holding, then backtest a dollar-book long/short.
 
-## Project Structure
-
-- `app.py` - Streamlit application frontend, sector screener, and dashboard layout.
-- `src/logic.py` - Quantitative backend with pair screening, cointegration, ADF, hedge ratio estimation, dollar-book sizing, signal generation, and backtest logic.
+- `app.py` - RelVal desk UI: universe heatmap, tether health, trade blotter, tape.
+- `src/logic.py` - Cointegration, Tether Score, rolling p-values, hedge ratios, signals, costs.
 - `requirements.txt` - Python dependencies.
 - `tests/test_logic.py` - Unit tests for the core quant logic.
 

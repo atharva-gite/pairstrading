@@ -5,3 +5,5 @@ yfinance
 statsmodels
 plotly
 pytest
+python-dotenv
+groq

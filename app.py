@@ -1,14 +1,24 @@
-import os
-import json
 from datetime import date, timedelta
+from html import escape
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
+from dotenv import load_dotenv
 
-from src.logic import PairsTradingEngine, SECTOR_UNIVERSES, download_price_data, screen_sector_pairs
+from src.logic import (
+    PairsTradingEngine,
+    SECTOR_UNIVERSES,
+    build_book_context,
+    call_llm,
+    download_price_data,
+    generate_desk_briefing,
+    pair_pvalue_matrix,
+    screen_sector_pairs,
+)
+
+load_dotenv()
 
 TICKER_NAMES = {
     "AAPL": "Apple",
@@ -46,100 +56,138 @@ SIZING_METHODS = ["Hedge Ratio", "Equal Dollar"]
 SECTOR_NAMES = list(SECTOR_UNIVERSES.keys())
 
 HEDGE_METHOD_DESCRIPTIONS = {
-    "Static OLS": "Uses a fixed historical hedge ratio for the sample period, making execution simpler for stable cointegrated pairs.",
-    "Rolling OLS": "Recomputes the hedge ratio over each lookback window to adapt to changing pair dynamics and regime shifts.",
-    "Kalman Filter": "Estimates the hedge ratio dynamically with state-space filtering, providing smoother adaptation to market noise.",
+    "Static OLS": "Fixed hedge for stable tethers. Best when the relationship is not drifting.",
+    "Rolling OLS": "Re-estimates beta each lookback window when the pair is rotating regimes.",
+    "Kalman Filter": "Smooths hedge-ratio drift. Use when the spread is tradable but beta is not static.",
 }
 
-BENCHMARK_DESCRIPTIONS = {
-    "SPY": "S&P 500 exposure shows how the pair behaves relative to the broad market, helping separate stock-specific alpha from factor risk.",
-    "QQQ": "Tech-heavy benchmark exposure highlights whether the pair is driven by growth sector swings rather than pair-specific mean reversion.",
-    "DIA": "Dow exposure helps assess whether the pair is sensitive to large-cap industrial and financial market moves.",
-    "IWM": "Small-cap benchmark exposure measures whether the pair's risk profile is aligned with more volatile, smaller-growth stocks.",
-    "XLK": "Technology sector exposure shows how much the pair is influenced by the tech factor versus pure cross-sectional relative value.",
+COPPER = "#c4a35a"
+MINT = "#7dce9a"
+ROSE = "#e07a5f"
+INK = "#e8e4d6"
+MUTED = "#9aa394"
+PLOT = "#121612"
+GRID = "#2a332c"
+
+STATE_COPY = {
+    "TETHERED": "The long-run relationship is intact. Mean reversion is statistically supported.",
+    "WEAK": "The tether is fraying. Trade smaller, or wait for the rolling p-value to settle.",
+    "BROKEN": "Do not treat this as a pairs book. The spread may be a directional residual.",
 }
 
 
-def build_contextual_system_prompt(metrics: dict | None) -> str:
-    default_metrics = {
-        "cointegration_p_value": None,
-        "sharpe_ratio": None,
-        "half_life": None,
-        "beta_ratio": None,
-    }
-    if metrics:
-        default_metrics.update(metrics)
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@600;700&family=IBM+Plex+Mono:wght@400;600&family=Outfit:wght@400;500;600&display=swap');
 
-    p_value = default_metrics.get("cointegration_p_value")
-    sharpe = default_metrics.get("sharpe_ratio")
-    half_life = default_metrics.get("half_life")
-    beta_ratio = default_metrics.get("beta_ratio")
-
-    p_value_text = "not available" if p_value is None else f"{p_value:.4f}"
-    sharpe_text = "not available" if sharpe is None else f"{sharpe:.2f}"
-    half_life_text = "not available" if half_life is None or pd.isna(half_life) else f"{half_life:.1f}"
-    beta_text = "not available" if beta_ratio is None else f"{beta_ratio:.3f}"
-
-    return (
-        "You are an AI Quantitative Assistant for a pairs trading strategy. "
-        "You act like a calm Quant Mentor who explains results plainly and with practical nuance. "
-        "Focus on statistical interpretation, risk, and decision quality. "
-        f"Latest backtest metrics: cointegration p-value={p_value_text}, Sharpe ratio={sharpe_text}, half-life={half_life_text}, beta ratio={beta_text}. "
-        "If the p-value is high, explain that it may signal weaker mean reversion, a regime shift, or an asymmetric risk event. "
-        "If the Sharpe is low, explain that the strategy may be under-earning after costs. "
-        "Use quantitative analogies such as the 'Drunken Man and his Dog' to explain cointegration in simple language. "
-        "Keep the tone expert, educational, and concise."
-    )
-
-
-def get_ai_reply(user_message: str, history: list[dict], system_prompt: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return fallback_ai_reply(user_message, system_prompt)
-
-    try:
-        payload = {
-            "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            "messages": [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_message}],
-            "temperature": 0.35,
+        :root {
+            --bg: #0c0f0d;
+            --panel: #151a16;
+            --line: #2a332c;
+            --text: #e8e4d6;
+            --muted: #9aa394;
+            --copper: #c4a35a;
+            --mint: #7dce9a;
+            --rose: #e07a5f;
         }
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            data=json.dumps(payload),
-            timeout=30,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"].strip()
-        return content or fallback_ai_reply(user_message, system_prompt)
-    except Exception:
-        return fallback_ai_reply(user_message, system_prompt)
-
-
-def fallback_ai_reply(user_message: str, system_prompt: str) -> str:
-    prompt = user_message.lower()
-    if "cointegration" in prompt or "co-integr" in prompt:
-        return (
-            "Cointegration is like the 'Drunken Man and his Dog' analogy: each one wanders randomly, but their relationship stays stable over time. "
-            "In pairs trading, that means the spread can drift and revert even when each stock moves independently."
-        )
-    if "p-value" in prompt or "p value" in prompt:
-        return (
-            "A high p-value usually suggests the spread may not be strongly stationary or mean-reverting. "
-            "That can happen after a regime shift, a liquidity shock, or an asymmetric risk event that breaks the old relationship."
-        )
-    if "sharpe" in prompt:
-        return "A lower Sharpe ratio usually means the strategy is not generating enough excess return per unit of risk after costs and slippage."
-    if "half-life" in prompt:
-        return "A shorter half-life often means the spread reverts more quickly, which can be attractive for short-horizon mean reversion strategies."
-    if "beta" in prompt:
-        return "Beta ratio helps you understand how much of the spread exposure is tied to the benchmark versus the pair-specific relationship."
-    if "correlation" in prompt and "cointegration" in prompt:
-        return "Correlation measures co-movement, while cointegration measures a stable long-run relationship. Two assets can be correlated without being cointegrated."
-    return (
-        f"I’m using your latest backtest context to guide the answer. {system_prompt.split('Latest backtest metrics:')[1].split('. ')[0] if 'Latest backtest metrics:' in system_prompt else ''} "
-        "Ask me about cointegration, p-values, Sharpe, beta, or risk controls and I’ll explain it in a quantitative way."
+        html, body, .stApp, [data-testid="stAppViewContainer"] {
+            background: var(--bg);
+            color: var(--text);
+            font-family: Outfit, system-ui, sans-serif;
+        }
+        [data-testid="stHeader"] { background: var(--bg); }
+        [data-testid="stSidebar"] { background: #101410; border-right: 1px solid var(--line); }
+        [data-testid="stSidebar"] * { color: var(--text); }
+        #MainMenu, footer, [data-testid="stDeployButton"] { visibility: hidden; }
+        h1, h2, h3 { font-family: Fraunces, Georgia, serif; letter-spacing: -0.02em; }
+        [data-testid="stMetricValue"] { font-family: "IBM Plex Mono", monospace; color: var(--text); }
+        [data-testid="stMetricLabel"] { color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.72rem; }
+        div[data-testid="stTabs"] button { font-family: Outfit, sans-serif; }
+        .brand-wrap { display: flex; justify-content: space-between; gap: 24px; align-items: flex-end; margin: 4px 0 18px; }
+        .brand-mark { font-family: Fraunces, serif; font-size: 2.1rem; font-weight: 700; color: var(--text); line-height: 1; }
+        .brand-mark span { color: var(--copper); }
+        .brand-kicker { color: var(--muted); font-size: 0.92rem; margin-top: 8px; max-width: 620px; }
+        .desk-chip {
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.78rem;
+            border: 1px solid var(--line);
+            padding: 8px 12px;
+            border-radius: 999px;
+            color: var(--muted);
+            white-space: nowrap;
+        }
+        .status-bar {
+            display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+            border: 1px solid var(--line); background: var(--panel);
+            border-radius: 12px; padding: 12px 14px; margin-bottom: 16px;
+        }
+        .pill { font-family: "IBM Plex Mono", monospace; font-size: 0.78rem; font-weight: 600; padding: 4px 10px; border-radius: 999px; }
+        .pill-tethered { background: rgba(125,206,154,0.16); color: var(--mint); }
+        .pill-weak { background: rgba(196,163,90,0.16); color: var(--copper); }
+        .pill-broken { background: rgba(224,122,95,0.16); color: var(--rose); }
+        .status-meta { color: var(--muted); font-size: 0.86rem; }
+        .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 8px 0 16px; }
+        .metric-card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-height: 92px; }
+        .metric-label { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+        .metric-value { font-family: "IBM Plex Mono", monospace; font-size: 1.28rem; font-weight: 600; margin-top: 8px; }
+        .metric-sub { color: var(--muted); font-size: 0.8rem; margin-top: 6px; }
+        .tone-mint .metric-value { color: var(--mint); }
+        .tone-rose .metric-value { color: var(--rose); }
+        .tone-copper .metric-value { color: var(--copper); }
+        .verdict {
+            border-left: 3px solid var(--copper);
+            padding: 8px 0 8px 14px;
+            color: var(--text);
+            margin: 4px 0 18px;
+        }
+        .briefing-headline { font-family: Fraunces, serif; font-size: 1.35rem; margin: 0 0 8px; }
+        .briefing-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 0 0 16px; }
+        .briefing-card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+        .briefing-card h4 { margin: 0 0 8px; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-family: Outfit, sans-serif; }
+        .briefing-card p { margin: 0; color: var(--text); font-size: 0.92rem; line-height: 1.45; }
+        @media (max-width: 900px) { .briefing-grid { grid-template-columns: 1fr; } }
+        .empty-panel {
+            border: 1px dashed var(--line);
+            border-radius: 12px;
+            padding: 28px 18px;
+            color: var(--muted);
+            background: #101410;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
+
+
+def metric_card(label: str, value: str, sub: str = "", tone: str = "") -> str:
+    cls = f"metric-card {tone}".strip()
+    return (
+        f'<div class="{cls}">'
+        f'<div class="metric-label">{escape(label)}</div>'
+        f'<div class="metric-value">{value}</div>'
+        f'<div class="metric-sub">{escape(sub)}</div>'
+        f"</div>"
+    )
+
+
+def apply_chart_layout(fig: go.Figure, title: str, y_title: str) -> go.Figure:
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=15, color=INK)),
+        yaxis_title=y_title,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor=PLOT,
+        font=dict(color=INK, family="Outfit"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=11)),
+        margin=dict(l=40, r=16, t=56, b=36),
+        xaxis=dict(gridcolor=GRID, zeroline=False),
+        yaxis=dict(gridcolor=GRID, zeroline=False),
+    )
+    return fig
+
+
+    return fig
 
 
 def ticker_label(ticker: str) -> str:
@@ -151,6 +199,18 @@ def ticker_from_label(label: str) -> str:
     return label.split(" ")[0]
 
 
+def fmt_pct(value: float) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{value:.1%}"
+
+
+def fmt_num(value: float, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{value:.{digits}f}"
+
+
 def trade_markers(positions: pd.Series) -> dict[str, pd.Series]:
     previous = positions.shift(1).fillna(0.0)
     return {
@@ -160,25 +220,19 @@ def trade_markers(positions: pd.Series) -> dict[str, pd.Series]:
     }
 
 
-def build_price_chart(
-    log_prices: pd.DataFrame,
-    asset_a: str,
-    asset_b: str,
-    positions: pd.Series | None = None,
-) -> go.Figure:
+def build_price_chart(log_prices: pd.DataFrame, asset_a: str, asset_b: str, positions: pd.Series | None = None) -> go.Figure:
     normalized = np.exp(log_prices.subtract(log_prices.iloc[0]))
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=normalized.index, y=normalized[asset_a], name=asset_a, line=dict(width=2)))
-    fig.add_trace(go.Scatter(x=normalized.index, y=normalized[asset_b], name=asset_b, line=dict(width=2)))
+    fig.add_trace(go.Scatter(x=normalized.index, y=normalized[asset_a], name=asset_a, line=dict(width=2, color=COPPER)))
+    fig.add_trace(go.Scatter(x=normalized.index, y=normalized[asset_b], name=asset_b, line=dict(width=2, color=MINT)))
     if positions is not None and not positions.empty:
         marks = trade_markers(positions)
         price_a = normalized[asset_a]
-        marker_specs = [
-            ("long_entry", "triangle-up", "green", "Long spread"),
-            ("short_entry", "triangle-down", "red", "Short spread"),
-            ("exit", "x", "gray", "Exit"),
-        ]
-        for key, symbol, color, label in marker_specs:
+        for key, symbol, color, label in [
+            ("long_entry", "triangle-up", MINT, "Long spread"),
+            ("short_entry", "triangle-down", ROSE, "Short spread"),
+            ("exit", "x", MUTED, "Exit"),
+        ]:
             idx = marks[key].index.intersection(price_a.index)
             if len(idx) == 0:
                 continue
@@ -191,43 +245,27 @@ def build_price_chart(
                     marker=dict(symbol=symbol, size=11, color=color),
                 )
             )
-    fig.update_layout(
-        title="Normalized Prices with Trade Entries and Exits",
-        yaxis_title="Normalized Price",
-        yaxis_type="log",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        template="plotly_white",
-    )
-    return fig
+    fig.update_yaxes(type="log")
+    return apply_chart_layout(fig, "Normalized prices · entries and exits", "Price")
 
 
 def build_spread_chart(spread: pd.Series, spread_mean: pd.Series) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=spread.index, y=spread, name="Spread", line=dict(color="#0055AA", width=2)))
-    fig.add_trace(go.Scatter(x=spread_mean.index, y=spread_mean, name="Rolling Mean", line=dict(color="#FF7F0E", width=1.5)))
-    fig.update_layout(
-        title="Mean-Reverting Spread",
-        yaxis_title="Log-Price Spread",
-        template="plotly_white",
-    )
-    return fig
+    fig.add_trace(go.Scatter(x=spread.index, y=spread, name="Spread", line=dict(color=COPPER, width=2)))
+    fig.add_trace(go.Scatter(x=spread_mean.index, y=spread_mean, name="Equilibrium", line=dict(color=MINT, width=1.5)))
+    return apply_chart_layout(fig, "Spread versus estimated equilibrium", "Log spread")
 
 
 def build_zscore_chart(zscore: pd.Series, entry_z: float, exit_z: float, stop_loss: float) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=zscore.index, y=zscore, name="Rolling Z-Score", line=dict(color="#0055AA", width=2)))
-    fig.add_hline(y=entry_z, line_dash="dash", line_color="red", annotation_text="Entry", annotation_position="top left")
-    fig.add_hline(y=-entry_z, line_dash="dash", line_color="green", annotation_text="Entry", annotation_position="bottom left")
-    fig.add_hline(y=exit_z, line_dash="dot", line_color="gray", annotation_text="Exit", annotation_position="top left")
-    fig.add_hline(y=-exit_z, line_dash="dot", line_color="gray", annotation_text="Exit", annotation_position="bottom left")
-    fig.add_hline(y=stop_loss, line_dash="dashdot", line_color="darkred", annotation_text="Stop Loss", annotation_position="top left")
-    fig.add_hline(y=-stop_loss, line_dash="dashdot", line_color="darkgreen", annotation_text="Stop Loss", annotation_position="bottom left")
-    fig.update_layout(
-        title="Rolling Z-Score with Trade Bands",
-        yaxis_title="Z-Score",
-        template="plotly_white",
-    )
-    return fig
+    fig.add_trace(go.Scatter(x=zscore.index, y=zscore, name="Z-score", line=dict(color=COPPER, width=2)))
+    fig.add_hline(y=entry_z, line_dash="dash", line_color=ROSE)
+    fig.add_hline(y=-entry_z, line_dash="dash", line_color=MINT)
+    fig.add_hline(y=exit_z, line_dash="dot", line_color=MUTED)
+    fig.add_hline(y=-exit_z, line_dash="dot", line_color=MUTED)
+    fig.add_hline(y=stop_loss, line_dash="dashdot", line_color=ROSE)
+    fig.add_hline(y=-stop_loss, line_dash="dashdot", line_color=ROSE)
+    return apply_chart_layout(fig, "Z-score with entry, exit, and stop bands", "Z")
 
 
 def build_returns_chart(
@@ -241,175 +279,155 @@ def build_returns_chart(
         go.Scatter(
             x=strategy_returns.index,
             y=np.exp(strategy_returns.cumsum()) - 1.0,
-            name="Pairs Strategy",
-            line=dict(color="#1F77B4"),
+            name="TETHER book",
+            line=dict(color=COPPER, width=2.2),
         )
     )
     fig.add_trace(
         go.Scatter(
             x=pair_buy_hold_cumulative.index,
             y=pair_buy_hold_cumulative,
-            name="Pair Buy & Hold",
-            line=dict(color="#2CA02C"),
+            name="Pair buy & hold",
+            line=dict(color=MINT, width=1.6),
         )
     )
     fig.add_trace(
         go.Scatter(
             x=benchmark_cumulative.index,
             y=benchmark_cumulative,
-            name=f"{benchmark_name} Buy & Hold",
-            line=dict(color="#FF7F0E"),
+            name=f"{benchmark_name} long-only",
+            line=dict(color=MUTED, width=1.4),
         )
     )
-    fig.update_layout(
-        title="Cumulative PnL vs Pair Buy-and-Hold and Benchmark",
-        yaxis_title="Cumulative Return",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        template="plotly_white",
+    return apply_chart_layout(fig, "Book versus holding the pair and the index", "Return")
+
+
+def build_tether_chart(rolling_p: pd.Series) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=rolling_p.index, y=rolling_p, name="Rolling p-value", line=dict(color=COPPER, width=2)))
+    fig.add_hline(y=0.05, line_dash="dash", line_color=MINT, annotation_text="5% line", annotation_font_color=MINT)
+    fig.add_hline(y=0.10, line_dash="dot", line_color=ROSE, annotation_text="break", annotation_font_color=ROSE)
+    return apply_chart_layout(fig, "Tether health · rolling Engle-Granger p-value", "p-value")
+
+
+def build_heatmap(matrix: pd.DataFrame) -> go.Figure:
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=matrix.values,
+            x=list(matrix.columns),
+            y=list(matrix.index),
+            colorscale=[[0, MINT], [0.5, COPPER], [1, ROSE]],
+            zmin=0,
+            zmax=0.2,
+            colorbar=dict(title="p-value"),
+            hovertemplate="%{y} / %{x}<br>p=%{z:.3f}<extra></extra>",
+        )
     )
-    return fig
+    return apply_chart_layout(fig, "Universe map · darker mint is a tighter tether", "Ticker")
 
 
-st.set_page_config(page_title="Pairs Trading Statistical Arbitrage Engine", layout="wide")
+def desk_verdict(metrics: dict, pair: str) -> str:
+    state = metrics.get("tether_state", "WEAK")
+    reason = metrics.get("tether_reason")
+    score = metrics.get("tether_score")
+    hl = metrics.get("half_life")
+    p_value = metrics.get("cointegration_p_value")
+    on_time = metrics.get("reverted_on_time")
+    trades = metrics.get("trade_count", 0)
 
-st.markdown("# Pairs Trading Statistical Arbitrage Engine")
+    if reason == "no_cointegration":
+        core = (
+            f"{pair} is not a tradable tether. The names can still move together through a shared factor "
+            f"(Engle-Granger p={fmt_num(p_value, 3)}). That is correlation, not a mean-reverting spread."
+        )
+    elif reason == "too_slow":
+        core = (
+            f"{pair} reverts too slowly for this book "
+            f"({hl:.0f}-day half-life; the desk wants 8–40 days). Inventory would sit for months."
+        )
+    elif reason == "too_fast":
+        core = f"{pair} mean-reverts too quickly to be distinguished from noise."
+    elif reason == "no_half_life":
+        core = f"{pair} does not show a usable mean-reversion clock."
+    else:
+        core = f"{pair} is {state} (score {fmt_num(score, 0)}). {STATE_COPY.get(state, '')}"
+
+    if trades and on_time is not None and not pd.isna(on_time) and hl is not None and 5 <= hl <= 60:
+        clock = f" {on_time:.0%} of round-trips closed inside 1.5× the {hl:.0f}-day clock."
+    elif trades and hl is not None and not pd.isna(hl) and hl > 60:
+        clock = f" On-time rate is not a green light here: 1.5× a {hl:.0f}-day clock is ~{hl * 1.5:.0f} days, so almost any trade looks punctual."
+    else:
+        clock = ""
+    return core + clock
+
+
+st.set_page_config(page_title="TETHER · RelVal Desk", layout="wide", page_icon="⚓")
+inject_css()
+
 st.markdown(
-    "A professional fintech tool for Engle-Granger cointegration analysis, factor beta-neutrality assessment, and dynamic hedge ratio execution."
+    """
+    <div class="brand-wrap">
+      <div>
+        <div class="brand-mark">TE<span>THER</span></div>
+        <div class="brand-kicker">Market-neutral pairs desk. You do not trade two stocks — you trade whether their tether is still holding.</div>
+      </div>
+      <div class="desk-chip">RELVAL · STAT ARB</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 with st.sidebar:
-    st.header("Engine Configuration")
-    st.markdown(
-        "Configure the pair, benchmark, risk thresholds, and hedge ratio method. Hover over each control for guidance."
-    )
-
-    with st.expander("Common Quant Questions", expanded=True):
-        st.markdown(
-            "- What is the difference between correlation and cointegration?\n"
-            "- Why does a high p-value matter for mean reversion?\n"
-            "- How should I interpret a low Sharpe ratio?\n"
-            "- What does a short half-life imply for spread reversion?"
-        )
-        st.caption("These answers are surfaced in the AI Quant Assistant tab below using the latest backtest context.")
-
+    st.markdown("**Ticket**")
     asset_labels = [ticker_label(ticker) for ticker in DEFAULT_TICKERS]
     asset_a_label = st.selectbox(
         "Asset A",
         asset_labels,
-        index=0,
+        index=DEFAULT_TICKERS.index("KO"),
         key="asset_a",
-        help="Select the first asset in the pair. Load a candidate from the Pair Screener tab to populate this.",
     )
     asset_b_label = st.selectbox(
         "Asset B",
         asset_labels,
-        index=1,
+        index=DEFAULT_TICKERS.index("PEP"),
         key="asset_b",
-        help="Select the second asset in the pair. Choose a cointegrated instrument from the same sector when possible.",
     )
     asset_a = ticker_from_label(asset_a_label)
     asset_b = ticker_from_label(asset_b_label)
+    benchmark = st.selectbox("Factor sleeve", BENCHMARKS, index=0, key="benchmark")
 
-    benchmark = st.selectbox(
-        "Benchmark",
-        BENCHMARKS,
-        index=0,
-        key="benchmark",
-        help="Select a market benchmark used for factor beta ratio estimation.",
-    )
-    st.caption(BENCHMARK_DESCRIPTIONS.get(benchmark, ""))
+    st.markdown("**Window**")
+    start_date = st.date_input("Start", date.today() - timedelta(days=365 * 2), key="start_date")
+    end_date = st.date_input("End", date.today(), key="end_date")
 
-    st.markdown("---")
-    st.subheader("Risk & Signal Parameters")
-    start_date = st.date_input(
-        "Start Date",
-        date.today() - timedelta(days=365 * 2),
-        key="start_date",
-        help="Choose the start of the historical sample used for the backtest.",
-    )
-    end_date = st.date_input(
-        "End Date",
-        date.today(),
-        key="end_date",
-        help="Choose the end of the historical sample used for the backtest.",
-    )
-    lookback = st.slider(
-        "Lookback Period (days)",
-        min_value=20,
-        max_value=180,
-        value=60,
-        step=10,
-        key="lookback",
-        help="Size of the rolling window used to compute spread mean, volatility, and rolling hedge ratios.",
-    )
-    entry_z = st.slider(
-        "Entry Z-Score",
-        min_value=1.0,
-        max_value=4.0,
-        value=2.0,
-        step=0.1,
-        key="entry_z",
-        help="The threshold at which the pair trade is entered when the spread becomes extended.",
-    )
-    exit_z = st.slider(
-        "Exit Z-Score",
-        min_value=0.1,
-        max_value=2.0,
-        value=0.5,
-        step=0.1,
-        key="exit_z",
-        help="The threshold at which the position is closed as the spread reverts.",
-    )
-    stop_loss = st.slider(
-        "Stop-Loss Z-Score",
-        min_value=1.0,
-        max_value=5.0,
-        value=3.0,
-        step=0.1,
-        key="stop_loss",
-        help="Hard stop for z-score deviations to limit downside risk.",
-    )
-    hedge_method = st.selectbox(
-        "Hedge Ratio Method",
-        HEDGE_METHODS,
-        key="hedge_method",
-        help="Choose static OLS, rolling regression, or Kalman filtering for hedge ratio estimation.",
-    )
+    st.markdown("**Signals**")
+    lookback = st.slider("Lookback (days)", min_value=20, max_value=180, value=60, step=10, key="lookback")
+    entry_z = st.slider("Entry |z|", min_value=1.0, max_value=4.0, value=2.0, step=0.1, key="entry_z")
+    exit_z = st.slider("Exit |z|", min_value=0.1, max_value=2.0, value=0.5, step=0.1, key="exit_z")
+    stop_loss = st.slider("Stop |z|", min_value=1.0, max_value=5.0, value=3.0, step=0.1, key="stop_loss")
+
+    st.markdown("**Book**")
+    hedge_method = st.selectbox("Hedge", HEDGE_METHODS, key="hedge_method")
     st.caption(HEDGE_METHOD_DESCRIPTIONS.get(hedge_method, ""))
-
-    capital = st.number_input(
-        "Dollar Book ($)",
-        min_value=10_000.0,
-        max_value=10_000_000.0,
-        value=100_000.0,
-        step=10_000.0,
-        key="capital",
-        help="Gross dollar capital allocated to the pair. Hedge-ratio sizing splits this as $A + $|beta| A = capital.",
-    )
-    sizing_method = st.selectbox(
-        "Position Sizing",
-        SIZING_METHODS,
-        key="sizing_method",
-        help="Hedge Ratio sizes B to the OLS/Kalman beta. Equal Dollar puts the same notional on each leg.",
-    )
-
-    st.markdown("---")
-    st.write("**Execution assumptions**")
-    st.caption("Slippage = 0.1%, commission = 0.05% of traded dollar notional per side.")
-    run_button = st.button("Run Backtest")
+    capital = st.number_input("Gross capital ($)", min_value=10_000.0, max_value=10_000_000.0, value=100_000.0, step=10_000.0, key="capital")
+    sizing_method = st.selectbox("Sizing", SIZING_METHODS, key="sizing_method")
+    st.caption("10 bps slippage + 5 bps commission on traded notional.")
+    run_button = st.button("Run the book", type="primary", use_container_width=True)
 
 if "ai_messages" not in st.session_state:
     st.session_state.ai_messages = []
 
 if asset_a == asset_b:
-    st.sidebar.error("Asset A and Asset B must be different.")
+    st.sidebar.error("Choose two different names.")
 
 result = st.session_state.get("latest_backtest")
 metrics = None if result is None else result.get("metrics")
 show_results = bool(result) and not result["data"].empty
+if show_results and not st.session_state.get("book_context"):
+    st.session_state["book_context"] = build_book_context(result)
 
 if run_button and asset_a != asset_b and start_date < end_date:
-    with st.spinner("Running the quant engine..."):
+    with st.spinner("Estimating the tether and running the book..."):
         engine = PairsTradingEngine(
             asset_a=asset_a,
             asset_b=asset_b,
@@ -430,159 +448,190 @@ if run_button and asset_a != asset_b and start_date < end_date:
 
     st.session_state["latest_backtest"] = result
     st.session_state["latest_backtest_metrics"] = result["metrics"]
-    st.session_state["assistant_system_prompt"] = build_contextual_system_prompt(result["metrics"])
+    st.session_state["book_context"] = build_book_context(result)
+    st.session_state.ai_messages = []
+    if not result["data"].empty:
+        with st.spinner("Groq is writing the desk briefing from this book..."):
+            st.session_state["desk_briefing"] = generate_desk_briefing(st.session_state["book_context"])
+    else:
+        st.session_state["desk_briefing"] = None
 
     if result["data"].empty:
-        st.error("No historical data loaded for the selected symbols and date range.")
+        st.error("No prices for that ticket and window.")
         show_results = False
         metrics = None
     else:
         metrics = result["metrics"]
         show_results = True
 
-st.markdown("---")
-main_tabs = st.tabs(["Pair Screener", "Strategy Setup", "Performance", "Diagnostics", "Charts", "AI Quant Assistant"])
+pair_name = f"{asset_a}/{asset_b}"
+if show_results:
+    state = metrics["tether_state"]
+    pill_class = {"TETHERED": "pill-tethered", "WEAK": "pill-weak", "BROKEN": "pill-broken"}.get(state, "pill-weak")
+    st.markdown(
+        f"""
+        <div class="status-bar">
+          <span class="pill {pill_class}">{escape(state)}</span>
+          <span class="status-meta"><b>{escape(result['asset_a'])}/{escape(result['asset_b'])}</b> · score {fmt_num(metrics['tether_score'], 0)} · p={metrics['cointegration_p_value']:.3f} · {escape(result['hedge_method'])} · ${metrics['capital']:,.0f}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+main_tabs = st.tabs(["Universe", "Desk", "Tape", "Research"])
 
 with main_tabs[0]:
-    st.markdown("### Sector Pair Screener")
-    st.markdown(
-        "Download a sector universe from Yahoo Finance, run Engle-Granger on every unique pair, "
-        "and rank by cointegration p-value and half-life. Load a candidate into the sidebar, then run the backtest."
-    )
+    st.markdown("Find a pair whose prices are still tied together, then load it as the ticket.")
     screen_cols = st.columns([2, 1, 1])
     with screen_cols[0]:
-        sector = st.selectbox("Sector Universe", SECTOR_NAMES, key="screen_sector")
+        sector = st.selectbox("Sector", SECTOR_NAMES, key="screen_sector")
     with screen_cols[1]:
-        p_threshold = st.number_input(
-            "p-value cutoff",
-            min_value=0.01,
-            max_value=0.20,
-            value=0.05,
-            step=0.01,
-            key="screen_p_value",
-        )
+        p_threshold = st.number_input("p-value line", min_value=0.01, max_value=0.20, value=0.05, step=0.01, key="screen_p_value")
     with screen_cols[2]:
         st.write("")
         st.write("")
-        run_screen = st.button("Screen Sector", type="primary")
+        run_screen = st.button("Scan sector", type="primary")
 
-    st.caption("Universe: " + ", ".join(SECTOR_UNIVERSES[sector]))
+    st.caption("Universe: " + " · ".join(SECTOR_UNIVERSES[sector]))
 
     if run_screen:
-        with st.spinner(f"Screening {sector} pairs..."):
-            sector_prices = download_price_data(
-                SECTOR_UNIVERSES[sector],
-                start_date.isoformat(),
-                end_date.isoformat(),
-            )
+        with st.spinner(f"Scoring {sector} tethers..."):
+            sector_prices = download_price_data(SECTOR_UNIVERSES[sector], start_date.isoformat(), end_date.isoformat())
             screen_table = screen_sector_pairs(sector_prices, p_value_threshold=float(p_threshold))
         st.session_state["screen_table"] = screen_table
         st.session_state["screen_sector_used"] = sector
 
     screen_table = st.session_state.get("screen_table")
     if screen_table is None:
-        st.info("Choose a sector and click Screen Sector. Classic examples: Energy (XOM/CVX), Consumer Staples (KO/PEP).")
+        st.markdown(
+            '<div class="empty-panel">Scan Energy for XOM/CVX or Consumer Staples for KO/PEP. Rankings use Tether Score, not raw correlation.</div>',
+            unsafe_allow_html=True,
+        )
     elif screen_table.empty:
-        st.warning("No pairs could be tested for this universe and date range.")
+        st.warning("No pairs could be tested in that window.")
     else:
         n_coint = int(screen_table["cointegrated"].sum())
-        st.success(f"{len(screen_table)} pairs tested, {n_coint} below the p-value cutoff.")
+        st.caption(f"{len(screen_table)} pairs scored · {n_coint} still under the p-value line.")
+        heat = pair_pvalue_matrix(screen_table)
+        if not heat.empty:
+            st.plotly_chart(build_heatmap(heat), use_container_width=True)
         display = screen_table.copy()
         display["p_value"] = display["p_value"].map(lambda x: f"{x:.4f}")
-        display["adf_p_value"] = display["adf_p_value"].map(lambda x: f"{x:.4f}")
+        display["tether_score"] = display["tether_score"].map(lambda x: f"{x:.0f}")
         display["hedge_ratio"] = display["hedge_ratio"].map(lambda x: f"{x:.3f}")
-        display["half_life"] = display["half_life"].map(lambda x: "n/a" if pd.isna(x) else f"{x:.1f}")
+        display["half_life"] = display["half_life"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f}d")
         st.dataframe(
-            display[["pair", "p_value", "adf_p_value", "hedge_ratio", "half_life", "cointegrated"]],
+            display[["pair", "tether_state", "tether_score", "p_value", "half_life", "hedge_ratio"]],
             use_container_width=True,
             hide_index=True,
         )
         pair_options = screen_table["pair"].tolist()
-        chosen_pair = st.selectbox("Load candidate into the engine", pair_options, key="screen_pair_choice")
-        if st.button("Use Selected Pair"):
+        chosen_pair = st.selectbox("Load into the ticket", pair_options, key="screen_pair_choice")
+        if st.button("Load pair"):
             chosen_a, chosen_b = chosen_pair.split("/")
             st.session_state["asset_a"] = ticker_label(chosen_a)
             st.session_state["asset_b"] = ticker_label(chosen_b)
             st.rerun()
 
 with main_tabs[1]:
-    st.markdown("### Strategy Setup")
     if show_results:
-        st.success("Backtest completed. Review the insights in the performance, diagnostics, charts, and assistant tabs.")
+        ticket = f"{result['asset_a']}/{result['asset_b']}"
+        briefing = st.session_state.get("desk_briefing") or {}
+        groq_verdict = (briefing.get("verdict") or "").strip()
+        if briefing.get("headline"):
+            st.markdown(f'<div class="briefing-headline">{escape(briefing["headline"])}</div>', unsafe_allow_html=True)
+        if groq_verdict:
+            st.markdown(f'<div class="verdict">{escape(groq_verdict)}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="verdict">{escape(desk_verdict(metrics, ticket))}</div>', unsafe_allow_html=True)
+        if briefing.get("drivers") or briefing.get("risks"):
+            st.markdown(
+                f"""
+                <div class="briefing-grid">
+                  <div class="briefing-card"><h4>What the book is saying</h4><p>{escape(briefing.get("drivers") or "—")}</p></div>
+                  <div class="briefing-card"><h4>What would change the read</h4><p>{escape(briefing.get("risks") or "—")}</p></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        if briefing.get("error"):
+            st.caption(f"Groq briefing unavailable: {briefing['error']}. Showing the rule-based verdict.")
+        pnl_tone = "tone-mint" if metrics["total_pnl"] >= 0 else "tone-rose"
+        state_tone = {"TETHERED": "tone-mint", "WEAK": "tone-copper", "BROKEN": "tone-rose"}.get(metrics["tether_state"], "")
+        cards = "".join(
+            [
+                metric_card("Tether score", fmt_num(metrics["tether_score"], 0), metrics["tether_state"], state_tone),
+                metric_card("Sharpe", fmt_num(metrics["sharpe_ratio"]), "after costs"),
+                metric_card("Max drawdown", fmt_pct(metrics["max_drawdown"]), "", "tone-rose"),
+                metric_card("Book PnL", f"${metrics['total_pnl']:,.0f}", f"on ${metrics['capital']:,.0f}", pnl_tone),
+                metric_card("Half-life", "—" if pd.isna(metrics["half_life"]) else f"{metrics['half_life']:.0f}d", "OU clock"),
+                metric_card(
+                    "On-time exits",
+                    fmt_pct(metrics.get("reverted_on_time")),
+                    "only scored if half-life is 5–60d" if pd.isna(metrics.get("reverted_on_time")) else f"{metrics['trade_count']} round-trips",
+                ),
+            ]
+        )
+        st.markdown(f'<div class="metric-grid">{cards}</div>', unsafe_allow_html=True)
+
+        left, right = st.columns([1.15, 1])
+        with left:
+            rolling_p = result.get("rolling_p_value", pd.Series(dtype=float))
+            if rolling_p is not None and len(rolling_p):
+                st.plotly_chart(build_tether_chart(rolling_p), use_container_width=True)
+            else:
+                st.caption("Need a longer window to plot rolling tether health.")
+            st.caption(
+                f"Engle-Granger p={metrics['cointegration_p_value']:.4f} · ADF p={metrics.get('adf_p_value', float('nan')):.4f} · "
+                f"hedge β={metrics['hedge_ratio']:.3f} · factor β ratio={fmt_num(metrics['beta_ratio'], 3)}"
+            )
+        with right:
+            st.markdown("**Blotter**")
+            blotter = result.get("blotter", pd.DataFrame())
+            if blotter is None or blotter.empty:
+                st.caption("No round-trips in this window. The z-score never crossed entry.")
+            else:
+                view = blotter.copy()
+                view["entry"] = pd.to_datetime(view["entry"]).dt.strftime("%Y-%m-%d")
+                view["exit"] = pd.to_datetime(view["exit"]).dt.strftime("%Y-%m-%d")
+                view["entry_z"] = view["entry_z"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+                view["exit_z"] = view["exit_z"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+                view["half_life_mult"] = view["half_life_mult"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f}×")
+                view["pnl"] = view["pnl"].map(lambda x: f"${x:,.0f}")
+                view = view.rename(
+                    columns={
+                        "side": "Side",
+                        "entry": "Entry",
+                        "exit": "Cover",
+                        "days": "Days",
+                        "entry_z": "Entry z",
+                        "exit_z": "Exit z",
+                        "half_life_mult": "vs HL",
+                        "pnl": "PnL",
+                        "reason": "How",
+                    }
+                )
+                st.dataframe(view, use_container_width=True, hide_index=True)
+                st.caption("vs HL is holding time divided by the spread half-life. Stops are relationship failures, not noise.")
     else:
         st.markdown(
-            "Screen a sector, load a cointegrated pair, then run a dollar-book long/short backtest with z-score entry and exit rules."
+            '<div class="empty-panel">Load a pair from Universe, then run the book. Desk shows tether health, dollar PnL, and whether exits arrived on the half-life clock.</div>',
+            unsafe_allow_html=True,
         )
-        st.markdown(
-            "- Sector pair screening with Engle-Granger tests\n"
-            "- Mean-reverting spread and rolling z-score signals\n"
-            "- Hedge-ratio or equal-dollar position sizing\n"
-            "- Transaction costs, stop-loss, and buy-and-hold comparison"
-        )
-        hero_cols = st.columns([2, 1])
-        with hero_cols[0]:
-            st.info("Fill in the sidebar and click Run Backtest, or load a pair from the screener first.")
-        with hero_cols[1]:
-            st.metric("Selected Pair", f"{asset_a} / {asset_b}")
-            st.metric("Benchmark", benchmark)
-            st.metric("Hedge Method", hedge_method)
-            st.metric("Dollar Book", f"${capital:,.0f}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Ticket", pair_name)
+        c2.metric("Sleeve", benchmark)
+        c3.metric("Hedge", hedge_method)
+        c4.metric("Capital", f"${capital:,.0f}")
 
 with main_tabs[2]:
     if show_results:
-        st.markdown("## Performance Summary")
-        perf_cols = st.columns([1, 1, 1, 1])
-        perf_cols[0].metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
-        perf_cols[1].metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
-        perf_cols[2].metric("Total Return", f"{metrics['total_return']:.2%}")
-        perf_cols[3].metric("Win Rate", f"{metrics['win_rate']:.2%}")
-        money_cols = st.columns([1, 1, 1, 1])
-        money_cols[0].metric("Starting Capital", f"${metrics['capital']:,.0f}")
-        money_cols[1].metric("Total PnL", f"${metrics['total_pnl']:,.0f}")
-        money_cols[2].metric("Ending Equity", f"${metrics['ending_equity']:,.0f}")
-        money_cols[3].metric(
-            "Half-Life",
-            "n/a" if pd.isna(metrics["half_life"]) else f"{metrics['half_life']:.1f} days",
-        )
-        st.caption(f"Sizing method: {metrics.get('sizing_method', sizing_method)}. Returns are dollar PnL divided by the dollar book.")
-    else:
-        st.info("Run a backtest to see performance metrics.")
-
-with main_tabs[3]:
-    if show_results:
-        st.markdown("## Model Diagnostics")
-        diag_cols = st.columns([1, 1, 1])
-        diag_cols[0].metric("Cointegration", metrics["cointegration_status"], f"p = {metrics['cointegration_p_value']:.4f}")
-        diag_cols[1].metric("Beta Ratio", f"{metrics['beta_ratio']:.3f}", f"A: {metrics['benchmark_beta_a']:.3f} / B: {metrics['benchmark_beta_b']:.3f}")
-        diag_cols[2].metric("Hedge Ratio", f"{metrics['hedge_ratio']:.3f}")
-        st.markdown("### Statistical Details")
-        st.write("- Engle-Granger cointegration validates long-term equilibrium between the log-price series.")
-        st.write("- Hedge-ratio sizing holds $A and $β of B so the book stays close to spread-neutral.")
-        st.write(f"- Cointegration p-value: **{metrics['cointegration_p_value']:.4f}**")
-        st.write(f"- Cointegration status: **{metrics['cointegration_status']}**")
-        st.write(f"- Beta A vs benchmark: **{metrics['benchmark_beta_a']:.3f}**")
-        st.write(f"- Beta B vs benchmark: **{metrics['benchmark_beta_b']:.3f}**")
-        st.write(f"- Factor beta ratio: **{metrics['beta_ratio']:.3f}**")
-        half_life_text = "n/a" if pd.isna(metrics["half_life"]) else f"{metrics['half_life']:.1f} days"
-        st.write(f"- Mean reversion half-life: **{half_life_text}**")
-    else:
-        st.info("Run a backtest to inspect the model diagnostics.")
-
-with main_tabs[4]:
-    if show_results:
-        st.markdown("### Overview Chart")
         chart_a = result["asset_a"]
         chart_b = result["asset_b"]
-        overview_cols = st.columns([2, 1])
-        with overview_cols[0]:
-            st.plotly_chart(
-                build_price_chart(result["log_prices"], chart_a, chart_b, result["positions"]),
-                use_container_width=True,
-            )
-            st.plotly_chart(
-                build_spread_chart(result["spread"], result["spread_mean"]),
-                use_container_width=True,
-            )
+        c1, c2 = st.columns([1.4, 1])
+        with c1:
+            st.plotly_chart(build_price_chart(result["log_prices"], chart_a, chart_b, result["positions"]), use_container_width=True)
+            st.plotly_chart(build_spread_chart(result["spread"], result["spread_mean"]), use_container_width=True)
             st.plotly_chart(
                 build_returns_chart(
                     result["strategy_returns"],
@@ -592,46 +641,40 @@ with main_tabs[4]:
                 ),
                 use_container_width=True,
             )
-        with overview_cols[1]:
+        with c2:
             st.plotly_chart(build_zscore_chart(result["zscore"], entry_z, exit_z, stop_loss), use_container_width=True)
-            st.markdown("#### Strategy Configuration")
-            st.write(f"**Pair:** {chart_a} / {chart_b}")
-            st.write(f"**Benchmark:** {result['benchmark']}")
-            st.write(f"**Lookback:** {lookback} days")
-            st.write(f"**Entry:** {entry_z} | Exit: {exit_z} | Stop-Loss: {stop_loss}")
-            st.write(f"**Hedge Method:** {result['hedge_method']}")
-            st.write(f"**Sizing:** {result['sizing_method']} on a ${metrics['capital']:,.0f} book")
-            st.write("Green triangles: long the spread. Red triangles: short the spread. Gray X: exit.")
+            st.markdown(
+                f"**{chart_a}/{chart_b}** · {result['sizing_method']} · lookback {lookback}d · entry {entry_z:g} / exit {exit_z:g} / stop {stop_loss:g}"
+            )
+            st.caption("Mint triangles long the spread. Rose triangles short it. Marks sit on asset A.")
     else:
-        st.info("Run a backtest to visualize spread, z-score, trade markers, and cumulative PnL.")
+        st.markdown('<div class="empty-panel">Run the book to see spread, z-score bands, and the PnL tape.</div>', unsafe_allow_html=True)
 
-with main_tabs[5]:
-    if "assistant_system_prompt" not in st.session_state:
-        st.session_state["assistant_system_prompt"] = build_contextual_system_prompt(st.session_state.get("latest_backtest_metrics"))
-
-    st.info("The assistant uses your latest backtest metrics as context and remembers your conversation while this session is active.")
-    for message in st.session_state.ai_messages:
-        if message["role"] == "user":
-            with st.chat_message("user"):
-                st.write(message["content"])
-        elif message["role"] == "assistant":
-            with st.chat_message("assistant"):
-                st.write(message["content"])
-
-    if prompt := st.chat_input("Ask about cointegration, p-values, Sharpe, beta, or risk controls..."):
-        st.session_state.ai_messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.write(prompt)
-
-        assistant_reply = get_ai_reply(
-            prompt,
-            st.session_state.ai_messages[:-1],
-            st.session_state["assistant_system_prompt"],
+with main_tabs[3]:
+    context = st.session_state.get("book_context")
+    if not show_results or not context:
+        st.markdown(
+            '<div class="empty-panel">Research is grounded in the last book. Run a ticket first, then ask why the tether scored the way it did.</div>',
+            unsafe_allow_html=True,
         )
-        st.session_state.ai_messages.append({"role": "assistant", "content": assistant_reply})
-        with st.chat_message("assistant"):
-            st.write(assistant_reply)
-
-    if st.button("Clear Conversation"):
-        st.session_state.ai_messages = []
-        st.rerun()
+    else:
+        st.caption(
+            f"Grounded on {context['pair']} · {context['metrics'].get('tether_state')} · "
+            f"score {context['metrics'].get('tether_score')} · {len(context.get('blotter') or [])} round-trips. "
+            "Groq only sees this book JSON, not the open web."
+        )
+        for message in st.session_state.ai_messages:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+        if prompt := st.chat_input("Ask about this book: tether, half-life, blotter, PnL, stops..."):
+            st.session_state.ai_messages.append({"role": "user", "content": prompt})
+            with st.spinner("Groq is reading the active book context..."):
+                llm = call_llm(st.session_state.ai_messages, context, task="research")
+            if llm.ok:
+                st.session_state.ai_messages.append({"role": "assistant", "content": llm.content})
+            else:
+                st.session_state.ai_messages.append({"role": "assistant", "content": llm.error or "Groq request failed."})
+            st.rerun()
+        if st.button("Clear research"):
+            st.session_state.ai_messages = []
+            st.rerun()
