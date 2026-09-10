@@ -6,7 +6,7 @@ Market-neutral pairs desk. You do not trade two stocks — you trade whether the
 
 *Universe (FDR) → walk-forward IS vs OOS → AAPL/MSFT as the negative control → borrow and net book β → Research grounded in the blotter.*
 
-**Live desk:** hosted Streamlit app (this repo). **Research note (PDF):** [KO/PEP vs AAPL/MSFT: when correlation is not a book](docs/ko-pep-vs-aapl-msft.pdf) · [markdown](docs/ko-pep-vs-aapl-msft.md)
+**Live Demo:** [Pair Trading Streamlit App](https://atharva-gite-pairstrading.streamlit.app/). **Research note (PDF):** [KO/PEP vs AAPL/MSFT: when correlation is not a book](docs/ko-pep-vs-aapl-msft.pdf) · [markdown](docs/ko-pep-vs-aapl-msft.md)
 
 ## Why this is not another z-score notebook
 
