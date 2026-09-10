@@ -12,6 +12,7 @@ from src.logic import (
     dollar_notionals,
     generate_desk_briefing,
     parse_desk_briefing,
+    apply_multiple_testing,
     screen_sector_pairs,
 )
 
@@ -78,19 +79,8 @@ def test_screen_sector_pairs_ranks_cointegrated_first():
     z = pd.Series(50 * np.exp(np.cumsum(rng.normal(0, 0.02, 180))), index=dates, name="Z")
     ranked = screen_sector_pairs(pd.concat([x, y, z], axis=1), p_value_threshold=0.05)
 
-    assert list(ranked.columns) == [
-        "asset_a",
-        "asset_b",
-        "pair",
-        "p_value",
-        "adf_p_value",
-        "hedge_ratio",
-        "half_life",
-        "tether_score",
-        "tether_state",
-        "tether_reason",
-        "cointegrated",
-    ]
+    assert "fdr_significant" in ranked.columns
+    assert "p_value_fdr" in ranked.columns
     assert len(ranked) == 3
     assert ranked.iloc[0]["pair"] in {"X/Y", "Y/X"}
     assert ranked.iloc[0]["tether_score"] >= ranked.iloc[-1]["tether_score"]
@@ -210,3 +200,62 @@ def test_generate_desk_briefing_parses_json(monkeypatch):
     assert briefing["headline"] == "H"
     assert briefing["verdict"] == "V"
     assert briefing["error"] is None
+
+
+def test_fdr_is_stricter_than_raw_pvalues():
+    ranked = pd.DataFrame({"p_value": [0.01, 0.04, 0.20, 0.49]})
+    adjusted = apply_multiple_testing(ranked, alpha=0.05)
+    assert adjusted["fdr_significant"].sum() <= (ranked["p_value"] < 0.05).sum()
+    assert adjusted["bonferroni_significant"].sum() <= adjusted["fdr_significant"].sum()
+
+
+def test_walk_forward_reports_is_and_oos_sharpe():
+    dates = pd.date_range("2022-01-03", periods=700, freq="B")
+    rng = np.random.default_rng(3)
+    spy = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(dates)))), index=dates)
+    asset_a = spy * 1.01 + rng.normal(0, 0.2, len(dates))
+    asset_b = 0.9 * asset_a + rng.normal(0, 0.15, len(dates))
+    engine = PairsTradingEngine(
+        "AAA",
+        "BBB",
+        "SPY",
+        "2022-01-03",
+        "2024-09-01",
+        lookback=30,
+        capital=100_000.0,
+        walk_forward=True,
+        split_date="2024-01-01",
+        charge_borrow=False,
+    )
+    engine.data = pd.DataFrame({"AAA": asset_a, "BBB": asset_b, "SPY": spy})
+    result = engine.run_backtest()
+    assert result["metrics"]["walk_forward"] is True
+    assert "is_sharpe" in result["metrics"]
+    assert "oos_sharpe" in result["metrics"]
+    assert "net_beta" in result
+
+
+def test_borrow_reduces_pnl_when_short():
+    dates = pd.date_range("2020-01-01", periods=80)
+    asset_a = pd.Series(100 * np.exp(np.linspace(0, 0.08, 80) + 0.02 * np.sin(np.arange(80) / 5)), index=dates)
+    asset_b = asset_a * 0.92 + 4.0
+    spy = asset_a * 1.01
+    data = pd.DataFrame({"AAA": asset_a, "BBB": asset_b, "SPY": spy})
+    common = dict(
+        asset_a="AAA",
+        asset_b="BBB",
+        benchmark="SPY",
+        start="2020-01-01",
+        end="2020-04-20",
+        lookback=20,
+        capital=100_000.0,
+        walk_forward=False,
+    )
+    cheap = PairsTradingEngine(**common, charge_borrow=False, borrow_bps=0.0)
+    rich = PairsTradingEngine(**common, charge_borrow=True, borrow_bps=500.0)
+    cheap.data = data.copy()
+    rich.data = data.copy()
+    cheap_pnl = cheap.run_backtest()["metrics"]["total_pnl"]
+    rich_pnl = rich.run_backtest()["metrics"]["total_pnl"]
+    assert rich_pnl <= cheap_pnl + 1e-6
+

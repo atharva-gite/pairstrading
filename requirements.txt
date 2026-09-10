@@ -7,3 +7,5 @@ plotly
 pytest
 python-dotenv
 groq
+matplotlib
+pillow

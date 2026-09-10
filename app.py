@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date
 from html import escape
 
 import numpy as np
@@ -302,6 +302,13 @@ def build_returns_chart(
     return apply_chart_layout(fig, "Book versus holding the pair and the index", "Return")
 
 
+def build_net_beta_chart(net_beta: pd.Series) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=net_beta.index, y=net_beta, name="Net book β", line=dict(color=COPPER, width=2)))
+    fig.add_hline(y=0, line_dash="dot", line_color=MUTED)
+    return apply_chart_layout(fig, "Net market beta of the dollar book", "β vs sleeve")
+
+
 def build_tether_chart(rolling_p: pd.Series) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=rolling_p.index, y=rolling_p, name="Rolling p-value", line=dict(color=COPPER, width=2)))
@@ -323,7 +330,7 @@ def build_heatmap(matrix: pd.DataFrame) -> go.Figure:
             hovertemplate="%{y} / %{x}<br>p=%{z:.3f}<extra></extra>",
         )
     )
-    return apply_chart_layout(fig, "Universe map · darker mint is a tighter tether", "Ticker")
+    return apply_chart_layout(fig, "Universe map · FDR-adjusted p-value (mint = tighter)", "Ticker")
 
 
 def desk_verdict(metrics: dict, pair: str) -> str:
@@ -397,8 +404,11 @@ with st.sidebar:
     benchmark = st.selectbox("Factor sleeve", BENCHMARKS, index=0, key="benchmark")
 
     st.markdown("**Window**")
-    start_date = st.date_input("Start", date.today() - timedelta(days=365 * 2), key="start_date")
+    start_date = st.date_input("Start", date(2019, 1, 1), key="start_date")
     end_date = st.date_input("End", date.today(), key="end_date")
+    walk_forward = st.checkbox("Walk-forward (no peeking)", value=True, key="walk_forward")
+    split_date = st.date_input("Discover / trade split", date(2024, 1, 1), key="split_date")
+    st.caption("Discover hedge and tether on or before the split. Trade only after it.")
 
     st.markdown("**Signals**")
     lookback = st.slider("Lookback (days)", min_value=20, max_value=180, value=60, step=10, key="lookback")
@@ -411,7 +421,17 @@ with st.sidebar:
     st.caption(HEDGE_METHOD_DESCRIPTIONS.get(hedge_method, ""))
     capital = st.number_input("Gross capital ($)", min_value=10_000.0, max_value=10_000_000.0, value=100_000.0, step=10_000.0, key="capital")
     sizing_method = st.selectbox("Sizing", SIZING_METHODS, key="sizing_method")
-    st.caption("10 bps slippage + 5 bps commission on traded notional.")
+    charge_borrow = st.checkbox("Charge stock-borrow on shorts", value=True, key="charge_borrow")
+    borrow_bps = st.number_input(
+        "Borrow (bps / year)",
+        min_value=0.0,
+        max_value=500.0,
+        value=50.0,
+        step=10.0,
+        key="borrow_bps",
+        disabled=not charge_borrow,
+    )
+    st.caption("10 bps slippage + 5 bps commission on traded notional. Borrow is an annualized rate on short dollars.")
     run_button = st.button("Run the book", type="primary", use_container_width=True)
 
 if "ai_messages" not in st.session_state:
@@ -443,6 +463,10 @@ if run_button and asset_a != asset_b and start_date < end_date:
             hedge_method=hedge_method,
             capital=float(capital),
             sizing_method=sizing_method,
+            walk_forward=walk_forward,
+            split_date=split_date.isoformat(),
+            charge_borrow=charge_borrow,
+            borrow_bps=float(borrow_bps),
         )
         result = engine.fetch().run_backtest()
 
@@ -497,7 +521,11 @@ with main_tabs[0]:
     if run_screen:
         with st.spinner(f"Scoring {sector} tethers..."):
             sector_prices = download_price_data(SECTOR_UNIVERSES[sector], start_date.isoformat(), end_date.isoformat())
-            screen_table = screen_sector_pairs(sector_prices, p_value_threshold=float(p_threshold))
+            screen_table = screen_sector_pairs(
+                sector_prices,
+                p_value_threshold=float(p_threshold),
+                split_date=split_date.isoformat() if walk_forward else None,
+            )
         st.session_state["screen_table"] = screen_table
         st.session_state["screen_sector_used"] = sector
 
@@ -511,20 +539,28 @@ with main_tabs[0]:
         st.warning("No pairs could be tested in that window.")
     else:
         n_coint = int(screen_table["cointegrated"].sum())
-        st.caption(f"{len(screen_table)} pairs scored · {n_coint} still under the p-value line.")
-        heat = pair_pvalue_matrix(screen_table)
+        n_fdr = int(screen_table["fdr_significant"].sum()) if "fdr_significant" in screen_table else 0
+        n_died = int(screen_table["tether_died"].sum()) if "tether_died" in screen_table else 0
+        n_tethered = int((screen_table["tether_state"] == "TETHERED").sum())
+        st.caption(
+            f"{n_fdr} of {len(screen_table)} pairs survive FDR. "
+            f"{n_coint} raw p-values sit under the uncorrected line. "
+            f"{n_died} of {n_tethered} TETHERED names die live after the split."
+        )
+        heat = pair_pvalue_matrix(screen_table, value_col="p_value_fdr" if "p_value_fdr" in screen_table.columns else "p_value")
         if not heat.empty:
             st.plotly_chart(build_heatmap(heat), use_container_width=True)
         display = screen_table.copy()
         display["p_value"] = display["p_value"].map(lambda x: f"{x:.4f}")
-        display["tether_score"] = display["tether_score"].map(lambda x: f"{x:.0f}")
-        display["hedge_ratio"] = display["hedge_ratio"].map(lambda x: f"{x:.3f}")
+        if "p_value_fdr" in display.columns:
+            display["p_value_fdr"] = display["p_value_fdr"].map(lambda x: "—" if pd.isna(x) else f"{x:.4f}")
+        display["tether_score"] = display["tether_score"].map(lambda x: f"{x:.0f}" if pd.notna(x) else "—")
+        display["hedge_ratio"] = display["hedge_ratio"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
         display["half_life"] = display["half_life"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f}d")
-        st.dataframe(
-            display[["pair", "tether_state", "tether_score", "p_value", "half_life", "hedge_ratio"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        cols = ["pair", "tether_state", "tether_score", "p_value", "p_value_fdr", "fdr_significant", "half_life"]
+        if "oos_tether_state" in display.columns:
+            cols.extend(["oos_tether_state", "tether_died"])
+        st.dataframe(display[[c for c in cols if c in display.columns]], use_container_width=True, hide_index=True)
         pair_options = screen_table["pair"].tolist()
         chosen_pair = st.selectbox("Load into the ticket", pair_options, key="screen_pair_choice")
         if st.button("Load pair"):
@@ -574,11 +610,52 @@ with main_tabs[1]:
         )
         st.markdown(f'<div class="metric-grid">{cards}</div>', unsafe_allow_html=True)
 
+        screen_table = st.session_state.get("screen_table")
+        if screen_table is not None and not screen_table.empty and "fdr_significant" in screen_table.columns:
+            n_fdr = int(screen_table["fdr_significant"].sum())
+            n_died = int(screen_table["tether_died"].sum()) if "tether_died" in screen_table else 0
+            n_tethered = int((screen_table["tether_state"] == "TETHERED").sum())
+            st.caption(
+                f"{n_fdr} of {len(screen_table)} sector pairs survive FDR. "
+                f"{n_died} of {n_tethered} TETHERED names die after the walk-forward split."
+            )
+
+        if metrics.get("walk_forward"):
+            wf = pd.DataFrame(
+                {
+                    "Sample": ["In-sample (discover)", "Out-of-sample (live)"],
+                    "Sharpe": [metrics.get("is_sharpe"), metrics.get("oos_sharpe")],
+                    "Return": [metrics.get("is_return"), metrics.get("oos_return")],
+                    "Tether": [metrics.get("tether_state"), metrics.get("oos_tether_state")],
+                }
+            )
+            st.markdown("**Walk-forward**")
+            wf_view = wf.copy()
+            wf_view["Sharpe"] = wf_view["Sharpe"].map(lambda v: "—" if pd.isna(v) else f"{v:.2f}")
+            wf_view["Return"] = wf_view["Return"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}")
+            st.dataframe(wf_view, hide_index=True, use_container_width=True)
+            is_s, oos_s = metrics.get("is_sharpe"), metrics.get("oos_sharpe")
+            if pd.notna(is_s) and pd.notna(oos_s) and oos_s < is_s:
+                st.caption("Out-of-sample Sharpe is worse than discovery. That is the point of walk-forward — leave it on the desk.")
+            if metrics.get("tether_died"):
+                st.caption("This pair was TETHERED in discovery and is not TETHERED live.")
+            st.caption(
+                f"Frozen hedge from {metrics.get('split_date')}. "
+                f"Net book β while on: mean {fmt_num(metrics.get('net_beta_mean'), 3)}, "
+                f"|β| {fmt_num(metrics.get('net_beta_abs_mean'), 3)}. "
+                f"Borrow charged: {metrics.get('borrow_bps'):.0f} bps (${metrics.get('borrow_cost_total', 0):,.0f})."
+            )
+        elif metrics.get("walk_forward") is False:
+            st.caption("Walk-forward needs enough bars on both sides of the split. Widen the window.")
+
         left, right = st.columns([1.15, 1])
         with left:
             rolling_p = result.get("rolling_p_value", pd.Series(dtype=float))
             if rolling_p is not None and len(rolling_p):
                 st.plotly_chart(build_tether_chart(rolling_p), use_container_width=True)
+            net_beta = result.get("net_beta")
+            if net_beta is not None and len(net_beta):
+                st.plotly_chart(build_net_beta_chart(net_beta), use_container_width=True)
             else:
                 st.caption("Need a longer window to plot rolling tether health.")
             st.caption(
