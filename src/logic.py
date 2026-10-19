@@ -47,6 +47,8 @@ SCREEN_COLUMNS = [
 ]
 
 MAX_TRADABLE_HALF_LIFE = 60.0
+DESK_GROSS_LIMIT = 10_000_000.0
+DEFAULT_MAX_LEG_PCT = 0.75
 
 LLM_PROVIDER_ENV = "LLM_PROVIDER"
 LLM_MODEL_ENV = "GROQ_MODEL"
@@ -473,11 +475,13 @@ def dollar_notionals(
     beta: pd.Series,
     capital: float,
     sizing_method: str = "Hedge Ratio",
+    max_leg_notional: float | None = None,
 ) -> tuple[pd.Series, pd.Series]:
     """Map a dollar book to legs A and B.
 
     Hedge Ratio: gross |A| + |B| = capital, with |B| = |beta| * |A|.
     Equal Dollar: |A| = |B| = capital / 2, still short B when beta > 0.
+    max_leg_notional scales both legs down together, so the hedge ratio holds and gross falls below capital.
     """
     abs_beta = beta.abs()
     if sizing_method == "Equal Dollar":
@@ -488,7 +492,12 @@ def dollar_notionals(
         denom = denom.replace(0.0, np.nan)
         notional_a = capital / denom
         notional_b = notional_a * beta
-    return notional_a.fillna(0.0), notional_b.fillna(0.0)
+    notional_a, notional_b = notional_a.fillna(0.0), notional_b.fillna(0.0)
+    if max_leg_notional is not None:
+        largest = np.maximum(notional_a.abs(), notional_b.abs())
+        scale = (max_leg_notional / largest.where(largest > 0)).clip(upper=1.0).fillna(1.0)
+        notional_a, notional_b = notional_a * scale, notional_b * scale
+    return notional_a, notional_b
 
 
 def pair_pvalue_matrix(screen_table: pd.DataFrame, value_col: str = "p_value") -> pd.DataFrame:
@@ -584,7 +593,13 @@ class PairsTradingEngine:
         split_date: str = "2024-01-01",
         charge_borrow: bool = True,
         borrow_bps: float = 50.0,
+        max_leg_pct: float = DEFAULT_MAX_LEG_PCT,
+        gross_limit: float = DESK_GROSS_LIMIT,
     ):
+        if not 0.0 < float(capital) <= float(gross_limit):
+            raise ValueError(f"Gross capital ${capital:,.0f} is outside the desk limit (0, ${gross_limit:,.0f}].")
+        if not 0.5 <= float(max_leg_pct) <= 1.0:
+            raise ValueError(f"max_leg_pct must be between 0.5 and 1.0, got {max_leg_pct}.")
         self.asset_a = asset_a
         self.asset_b = asset_b
         self.benchmark = benchmark
@@ -603,6 +618,7 @@ class PairsTradingEngine:
         self.split_date = split_date
         self.charge_borrow = charge_borrow
         self.borrow_bps = float(borrow_bps)
+        self.max_leg_pct = float(max_leg_pct)
         self.data = pd.DataFrame()
 
     def fetch(self) -> PairsTradingEngine:
@@ -671,7 +687,12 @@ class PairsTradingEngine:
         beta_ratio_info = compute_beta_ratio(factor_source_a, factor_source_b, factor_source_m)
 
         beta_lag = beta.shift(1).ffill().fillna(0.0)
-        notional_a, notional_b = dollar_notionals(beta_lag, self.capital, self.sizing_method)
+        max_leg = self.max_leg_pct * self.capital
+        notional_a, notional_b = dollar_notionals(beta_lag, self.capital, self.sizing_method, max_leg_notional=max_leg)
+        uncapped_a, uncapped_b = dollar_notionals(beta_lag, self.capital, self.sizing_method)
+        leg_cap_binding = (np.maximum(uncapped_a.abs(), uncapped_b.abs()) > max_leg + 1e-9) & (
+            positions.shift(1).fillna(0.0) != 0
+        )
         pos_lag = positions.shift(1).fillna(0.0)
 
         held_a = pos_lag * notional_a
@@ -797,6 +818,8 @@ class PairsTradingEngine:
                 "charge_borrow": self.charge_borrow,
                 "borrow_bps": self.borrow_bps,
                 "borrow_cost_total": float(borrow_cost.sum()),
+                "max_leg_pct": self.max_leg_pct,
+                "leg_cap_binding_days": int(leg_cap_binding.sum()),
                 "net_beta_mean": float(active_net.mean()) if len(active_net) else 0.0,
                 "net_beta_abs_mean": float(active_net.abs().mean()) if len(active_net) else 0.0,
             },
