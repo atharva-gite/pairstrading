@@ -12,6 +12,7 @@ from src.logic import (
     PairsTradingEngine,
     build_book_context,
     call_llm,
+    cost_sensitivity,
     download_price_data,
     generate_desk_briefing,
     pair_pvalue_matrix,
@@ -472,6 +473,7 @@ if run_button and asset_a != asset_b and start_date < end_date:
             borrow_bps=float(borrow_bps),
         )
         result = engine.fetch().run_backtest()
+        st.session_state["cost_grid"] = cost_sensitivity(engine) if not result["data"].empty else None
 
     st.session_state["latest_backtest"] = result
     st.session_state["latest_backtest_metrics"] = result["metrics"]
@@ -662,6 +664,21 @@ with main_tabs[1]:
             )
         elif metrics.get("walk_forward") is False:
             st.caption("Walk-forward needs enough bars on both sides of the split. Widen the window.")
+
+        cost_grid = st.session_state.get("cost_grid")
+        if cost_grid is not None and not cost_grid.empty:
+            st.markdown("**Cost sensitivity**")
+            grid_view = pd.DataFrame(
+                {
+                    "Slippage": cost_grid["slippage_bps"].map(lambda v: f"{v:.0f} bps"),
+                    "Commission": cost_grid["commission_bps"].map(lambda v: f"{v:.0f} bps"),
+                    "Book PnL": cost_grid["total_pnl"].map(lambda v: f"${v:,.0f}"),
+                    "Sharpe": cost_grid["sharpe_ratio"].map(lambda v: fmt_num(v)),
+                    "OOS Sharpe": cost_grid["oos_sharpe"].map(lambda v: fmt_num(v)),
+                }
+            )
+            st.dataframe(grid_view, hide_index=True, use_container_width=True)
+            st.caption("Same signals, different slippage. If the edge disappears at 5 bps, it was never there.")
 
         left, right = st.columns([1.15, 1])
         with left:
