@@ -425,6 +425,9 @@ with st.sidebar:
         "Gross capital ($)", min_value=10_000.0, max_value=10_000_000.0, value=100_000.0, step=10_000.0, key="capital"
     )
     sizing_method = st.selectbox("Sizing", SIZING_METHODS, key="sizing_method")
+    max_leg_pct = st.number_input(
+        "Max per leg (% of gross)", min_value=50, max_value=100, value=75, step=5, key="max_leg_pct"
+    )
     charge_borrow = st.checkbox("Charge stock-borrow on shorts", value=True, key="charge_borrow")
     borrow_bps = st.number_input(
         "Borrow (bps / year)",
@@ -471,6 +474,7 @@ if run_button and asset_a != asset_b and start_date < end_date:
             split_date=split_date.isoformat(),
             charge_borrow=charge_borrow,
             borrow_bps=float(borrow_bps),
+            max_leg_pct=max_leg_pct / 100.0,
         )
         result = engine.fetch().run_backtest()
         st.session_state["cost_grid"] = cost_sensitivity(engine) if not result["data"].empty else None
@@ -660,7 +664,9 @@ with main_tabs[1]:
                 f"Frozen hedge from {metrics.get('split_date')}. "
                 f"Net book β while on: mean {fmt_num(metrics.get('net_beta_mean'), 3)}, "
                 f"|β| {fmt_num(metrics.get('net_beta_abs_mean'), 3)}. "
-                f"Borrow charged: {metrics.get('borrow_bps'):.0f} bps (${metrics.get('borrow_cost_total', 0):,.0f})."
+                f"Borrow charged: {metrics.get('borrow_bps'):.0f} bps (${metrics.get('borrow_cost_total', 0):,.0f}). "
+                f"Leg cap {metrics.get('max_leg_pct', 1.0):.0%} of gross bound on "
+                f"{metrics.get('leg_cap_binding_days', 0)} days in the book."
             )
         elif metrics.get("walk_forward") is False:
             st.caption("Walk-forward needs enough bars on both sides of the split. Widen the window.")
