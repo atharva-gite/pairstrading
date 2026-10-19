@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -797,6 +798,31 @@ class PairsTradingEngine:
                 "net_beta_abs_mean": float(active_net.abs().mean()) if len(active_net) else 0.0,
             },
         }
+
+
+COST_GRID_SLIPPAGE_BPS = (0.0, 5.0, 15.0)
+
+
+def cost_sensitivity(
+    engine: PairsTradingEngine,
+    slippage_bps: tuple[float, ...] = COST_GRID_SLIPPAGE_BPS,
+) -> pd.DataFrame:
+    """Rerun the loaded book at each slippage level; signals do not depend on costs, only PnL does."""
+    rows = []
+    for bps in slippage_bps:
+        variant = copy.copy(engine)
+        variant.slippage = bps / 10_000.0
+        metrics = variant.run_backtest()["metrics"]
+        rows.append(
+            {
+                "slippage_bps": float(bps),
+                "commission_bps": engine.commission * 10_000.0,
+                "total_pnl": metrics["total_pnl"],
+                "sharpe_ratio": metrics["sharpe_ratio"],
+                "oos_sharpe": metrics["oos_sharpe"],
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _load_project_dotenv() -> None:
