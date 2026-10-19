@@ -1,0 +1,30 @@
+[project]
+name = "tether"
+version = "0.1.0"
+description = "Market-neutral pairs desk: walk-forward cointegration, FDR screening, dollar book with borrow and net beta."
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::statsmodels.tools.sm_exceptions.CollinearityWarning",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 65
+show_missing = true
+skip_covered = false

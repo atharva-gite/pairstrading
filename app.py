@@ -8,8 +8,8 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from src.logic import (
-    PairsTradingEngine,
     SECTOR_UNIVERSES,
+    PairsTradingEngine,
     build_book_context,
     call_llm,
     download_price_data,
@@ -186,7 +186,6 @@ def apply_chart_layout(fig: go.Figure, title: str, y_title: str) -> go.Figure:
     )
     return fig
 
-
     return fig
 
 
@@ -220,7 +219,9 @@ def trade_markers(positions: pd.Series) -> dict[str, pd.Series]:
     }
 
 
-def build_price_chart(log_prices: pd.DataFrame, asset_a: str, asset_b: str, positions: pd.Series | None = None) -> go.Figure:
+def build_price_chart(
+    log_prices: pd.DataFrame, asset_a: str, asset_b: str, positions: pd.Series | None = None
+) -> go.Figure:
     normalized = np.exp(log_prices.subtract(log_prices.iloc[0]))
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=normalized.index, y=normalized[asset_a], name=asset_a, line=dict(width=2, color=COPPER)))
@@ -419,7 +420,9 @@ with st.sidebar:
     st.markdown("**Book**")
     hedge_method = st.selectbox("Hedge", HEDGE_METHODS, key="hedge_method")
     st.caption(HEDGE_METHOD_DESCRIPTIONS.get(hedge_method, ""))
-    capital = st.number_input("Gross capital ($)", min_value=10_000.0, max_value=10_000_000.0, value=100_000.0, step=10_000.0, key="capital")
+    capital = st.number_input(
+        "Gross capital ($)", min_value=10_000.0, max_value=10_000_000.0, value=100_000.0, step=10_000.0, key="capital"
+    )
     sizing_method = st.selectbox("Sizing", SIZING_METHODS, key="sizing_method")
     charge_borrow = st.checkbox("Charge stock-borrow on shorts", value=True, key="charge_borrow")
     borrow_bps = st.number_input(
@@ -496,7 +499,7 @@ if show_results:
         f"""
         <div class="status-bar">
           <span class="pill {pill_class}">{escape(state)}</span>
-          <span class="status-meta"><b>{escape(result['asset_a'])}/{escape(result['asset_b'])}</b> · score {fmt_num(metrics['tether_score'], 0)} · p={metrics['cointegration_p_value']:.3f} · {escape(result['hedge_method'])} · ${metrics['capital']:,.0f}</span>
+          <span class="status-meta"><b>{escape(result["asset_a"])}/{escape(result["asset_b"])}</b> · score {fmt_num(metrics["tether_score"], 0)} · p={metrics["cointegration_p_value"]:.3f} · {escape(result["hedge_method"])} · ${metrics["capital"]:,.0f}</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -510,7 +513,9 @@ with main_tabs[0]:
     with screen_cols[0]:
         sector = st.selectbox("Sector", SECTOR_NAMES, key="screen_sector")
     with screen_cols[1]:
-        p_threshold = st.number_input("p-value line", min_value=0.01, max_value=0.20, value=0.05, step=0.01, key="screen_p_value")
+        p_threshold = st.number_input(
+            "p-value line", min_value=0.01, max_value=0.20, value=0.05, step=0.01, key="screen_p_value"
+        )
     with screen_cols[2]:
         st.write("")
         st.write("")
@@ -547,7 +552,9 @@ with main_tabs[0]:
             f"{n_coint} raw p-values sit under the uncorrected line. "
             f"{n_died} of {n_tethered} TETHERED names die live after the split."
         )
-        heat = pair_pvalue_matrix(screen_table, value_col="p_value_fdr" if "p_value_fdr" in screen_table.columns else "p_value")
+        heat = pair_pvalue_matrix(
+            screen_table, value_col="p_value_fdr" if "p_value_fdr" in screen_table.columns else "p_value"
+        )
         if not heat.empty:
             st.plotly_chart(build_heatmap(heat), use_container_width=True)
         display = screen_table.copy()
@@ -593,18 +600,24 @@ with main_tabs[1]:
         if briefing.get("error"):
             st.caption(f"Groq briefing unavailable: {briefing['error']}. Showing the rule-based verdict.")
         pnl_tone = "tone-mint" if metrics["total_pnl"] >= 0 else "tone-rose"
-        state_tone = {"TETHERED": "tone-mint", "WEAK": "tone-copper", "BROKEN": "tone-rose"}.get(metrics["tether_state"], "")
+        state_tone = {"TETHERED": "tone-mint", "WEAK": "tone-copper", "BROKEN": "tone-rose"}.get(
+            metrics["tether_state"], ""
+        )
         cards = "".join(
             [
                 metric_card("Tether score", fmt_num(metrics["tether_score"], 0), metrics["tether_state"], state_tone),
                 metric_card("Sharpe", fmt_num(metrics["sharpe_ratio"]), "after costs"),
                 metric_card("Max drawdown", fmt_pct(metrics["max_drawdown"]), "", "tone-rose"),
                 metric_card("Book PnL", f"${metrics['total_pnl']:,.0f}", f"on ${metrics['capital']:,.0f}", pnl_tone),
-                metric_card("Half-life", "—" if pd.isna(metrics["half_life"]) else f"{metrics['half_life']:.0f}d", "OU clock"),
+                metric_card(
+                    "Half-life", "—" if pd.isna(metrics["half_life"]) else f"{metrics['half_life']:.0f}d", "OU clock"
+                ),
                 metric_card(
                     "On-time exits",
                     fmt_pct(metrics.get("reverted_on_time")),
-                    "only scored if half-life is 5–60d" if pd.isna(metrics.get("reverted_on_time")) else f"{metrics['trade_count']} round-trips",
+                    "only scored if half-life is 5–60d"
+                    if pd.isna(metrics.get("reverted_on_time"))
+                    else f"{metrics['trade_count']} round-trips",
                 ),
             ]
         )
@@ -636,7 +649,9 @@ with main_tabs[1]:
             st.dataframe(wf_view, hide_index=True, use_container_width=True)
             is_s, oos_s = metrics.get("is_sharpe"), metrics.get("oos_sharpe")
             if pd.notna(is_s) and pd.notna(oos_s) and oos_s < is_s:
-                st.caption("Out-of-sample Sharpe is worse than discovery. That is the point of walk-forward — leave it on the desk.")
+                st.caption(
+                    "Out-of-sample Sharpe is worse than discovery. That is the point of walk-forward — leave it on the desk."
+                )
             if metrics.get("tether_died"):
                 st.caption("This pair was TETHERED in discovery and is not TETHERED live.")
             st.caption(
@@ -689,7 +704,9 @@ with main_tabs[1]:
                     }
                 )
                 st.dataframe(view, use_container_width=True, hide_index=True)
-                st.caption("vs HL is holding time divided by the spread half-life. Stops are relationship failures, not noise.")
+                st.caption(
+                    "vs HL is holding time divided by the spread half-life. Stops are relationship failures, not noise."
+                )
     else:
         st.markdown(
             '<div class="empty-panel">Load a pair from Universe, then run the book. Desk shows tether health, dollar PnL, and whether exits arrived on the half-life clock.</div>',
@@ -707,7 +724,9 @@ with main_tabs[2]:
         chart_b = result["asset_b"]
         c1, c2 = st.columns([1.4, 1])
         with c1:
-            st.plotly_chart(build_price_chart(result["log_prices"], chart_a, chart_b, result["positions"]), use_container_width=True)
+            st.plotly_chart(
+                build_price_chart(result["log_prices"], chart_a, chart_b, result["positions"]), use_container_width=True
+            )
             st.plotly_chart(build_spread_chart(result["spread"], result["spread_mean"]), use_container_width=True)
             st.plotly_chart(
                 build_returns_chart(
@@ -725,7 +744,10 @@ with main_tabs[2]:
             )
             st.caption("Mint triangles long the spread. Rose triangles short it. Marks sit on asset A.")
     else:
-        st.markdown('<div class="empty-panel">Run the book to see spread, z-score bands, and the PnL tape.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="empty-panel">Run the book to see spread, z-score bands, and the PnL tape.</div>',
+            unsafe_allow_html=True,
+        )
 
 with main_tabs[3]:
     context = st.session_state.get("book_context")
@@ -750,7 +772,9 @@ with main_tabs[3]:
             if llm.ok:
                 st.session_state.ai_messages.append({"role": "assistant", "content": llm.content})
             else:
-                st.session_state.ai_messages.append({"role": "assistant", "content": llm.error or "Groq request failed."})
+                st.session_state.ai_messages.append(
+                    {"role": "assistant", "content": llm.error or "Groq request failed."}
+                )
             st.rerun()
         if st.button("Clear research"):
             st.session_state.ai_messages = []
