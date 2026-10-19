@@ -50,7 +50,11 @@ ruff check . && ruff format --check .
 pytest --cov
 ```
 
-CI runs the same lint and tests on Python 3.12 and 3.14 for every push and pull request. Tests are offline (synthetic prices, mocked Groq), and the build fails if coverage of `src/` drops below the floor in `pyproject.toml`.
+CI runs the same lint and tests on Python 3.12 and 3.14 for every push and pull request. Tests are offline (synthetic prices, a checked-in KO/PEP/AAPL/MSFT/SPY fixture, mocked Groq), and the build fails if coverage of `src/` drops below the floor in `pyproject.toml`.
+
+`tests/test_regression.py` pins the walk-forward numbers for KO/PEP and AAPL/MSFT. If a model change moves them on purpose, run `python3 scripts/refresh_fixture.py` and review the JSON diff in the pull request.
+
+Weekly jobs: Dependabot updates, `pip-audit` on the pinned requirements, and a live Yahoo Finance smoke test (`pytest -m live`).
 
 Rebuild the GIF and PDF:
 
@@ -61,14 +65,20 @@ python3 scripts/make_demo_assets.py
 ## Layout
 
 - `app.py` — RelVal desk: Universe, Desk, Tape, Research
-- `src/logic.py` — Engle–Granger, FDR, walk-forward, Kalman/OLS hedge, dollar book, borrow, net β, Groq
+- `src/stats.py` — Engle–Granger, Kalman/rolling OLS hedge, half-life, tether score, FDR sector screen
+- `src/book.py` — signals, dollar sizing with per-leg cap, blotter, performance
+- `src/engine.py` — walk-forward `PairsTradingEngine`, borrow, net β, cost sensitivity
+- `src/llm.py` — Groq desk briefing and Research chat grounded in the book JSON
+- `src/logic.py` — public API re-exporting the above
 - `docs/ko-pep-vs-aapl-msft.pdf` — 2–3 page note for recruiters
 - `docs/assets/tether.gif` — 20s walkthrough
-- `tests/test_logic.py` — cointegration, FDR, walk-forward, borrow, Groq mocks
+- `tests/` — unit tests, frozen real-price regression, book limits, Groq mocks, app smoke test
 
 ## Notes
 
 - Spreads and returns are in **log prices**.
 - Hedge methods: Static OLS (frozen in walk-forward), Rolling OLS, Kalman Filter.
 - Hedge-ratio sizing: `|A| + |β|×|A| = capital`. Equal-dollar puts the same notional on each leg.
-- Costs: 10 bps slippage + 5 bps commission on traded notional, plus optional annualized borrow on shorts.
+- Costs: 10 bps slippage + 5 bps commission on traded notional, plus optional annualized borrow on shorts. The Desk reruns the book at 0 / 5 / 15 bps slippage.
+- Limits: gross capital up to $10M per ticket; each leg capped at 75% of gross by default, scaling both legs so β holds.
+- A pair with half-life above 60 days can be WEAK at best, never TETHERED.
