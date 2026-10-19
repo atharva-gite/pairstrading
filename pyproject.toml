@@ -15,7 +15,8 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not live'"
+markers = ["live: hits Yahoo Finance; excluded by default, run with `pytest -m live`"]
 filterwarnings = [
     "ignore::statsmodels.tools.sm_exceptions.CollinearityWarning",
 ]
