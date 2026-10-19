@@ -1,0 +1,32 @@
+{
+  "AAPL/MSFT": {
+    "cointegration_p_value": 0.234691,
+    "half_life": 50.984651,
+    "hedge_ratio": 1.321439,
+    "is_return": 0.153487,
+    "is_sharpe": 0.387793,
+    "net_beta_abs_mean": 0.149199,
+    "oos_return": -0.145082,
+    "oos_sharpe": -0.672764,
+    "oos_tether_state": "BROKEN",
+    "tether_score": 32.311272,
+    "tether_state": "BROKEN",
+    "total_pnl": -1396.035708,
+    "trade_count": 67
+  },
+  "KO/PEP": {
+    "cointegration_p_value": 0.029671,
+    "half_life": 38.519484,
+    "hedge_ratio": 0.750018,
+    "is_return": -0.152748,
+    "is_sharpe": -0.590695,
+    "net_beta_abs_mean": 0.078077,
+    "oos_return": -0.12427,
+    "oos_sharpe": -0.935784,
+    "oos_tether_state": "BROKEN",
+    "tether_score": 83.694951,
+    "tether_state": "TETHERED",
+    "total_pnl": -29845.364124,
+    "trade_count": 66
+  }
+}
