@@ -11,10 +11,14 @@ from src.logic import (
     SECTOR_UNIVERSES,
     PairsTradingEngine,
     build_book_context,
+    build_tape_context,
+    build_universe_context,
     call_llm,
+    configured_providers,
     cost_sensitivity,
     download_price_data,
     generate_desk_briefing,
+    generate_view_summary,
     pair_pvalue_matrix,
     screen_sector_pairs,
 )
@@ -70,6 +74,15 @@ MUTED = "#9aa394"
 PLOT = "#121612"
 GRID = "#2a332c"
 
+METRIC_HELP = {
+    "Tether score": "0-100: how convincingly the two stocks are tied together (cointegration, half-life, hedge stability).",
+    "Sharpe": "Annualized return divided by volatility, after trading costs and borrow. Negative means the book lost money.",
+    "Max drawdown": "Largest peak-to-trough fall in the book's value.",
+    "Book PnL": "Dollar profit or loss of the long-short book over the whole window.",
+    "Half-life": "Trading days for the gap between the stocks to close halfway. The desk wants 8-40 days.",
+    "On-time exits": "Share of trades that closed within 1.5x the half-life. Only scored when half-life is 5-60 days.",
+}
+
 STATE_COPY = {
     "TETHERED": "The long-run relationship is intact. Mean reversion is statistically supported.",
     "WEAK": "The tether is fraying. Trade smaller, or wait for the rolling p-value to settle.",
@@ -81,7 +94,7 @@ def inject_css() -> None:
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@600;700&family=IBM+Plex+Mono:wght@400;600&family=Outfit:wght@400;500;600&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600&display=swap');
 
         :root {
             --bg: #0c0f0d;
@@ -92,6 +105,11 @@ def inject_css() -> None:
             --copper: #c4a35a;
             --mint: #7dce9a;
             --rose: #e07a5f;
+            --chip-text: #a3ad9d;
+            --chip-line: #29332c;
+            --help-surface: #151815;
+            --help-line: #343b35;
+            --help-hover: #20251f;
         }
         html, body, .stApp, [data-testid="stAppViewContainer"] {
             background: var(--bg);
@@ -101,24 +119,58 @@ def inject_css() -> None:
         [data-testid="stHeader"] { background: var(--bg); }
         [data-testid="stSidebar"] { background: #101410; border-right: 1px solid var(--line); }
         [data-testid="stSidebar"] * { color: var(--text); }
-        #MainMenu, footer, [data-testid="stDeployButton"] { visibility: hidden; }
+        #MainMenu, footer, [data-testid="stDeployButton"], [data-testid="stSidebarNav"] { visibility: hidden; height: 0; }
         h1, h2, h3 { font-family: Fraunces, Georgia, serif; letter-spacing: -0.02em; }
         [data-testid="stMetricValue"] { font-family: "IBM Plex Mono", monospace; color: var(--text); }
         [data-testid="stMetricLabel"] { color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.72rem; }
         div[data-testid="stTabs"] button { font-family: Outfit, sans-serif; }
-        .brand-wrap { display: flex; justify-content: space-between; gap: 24px; align-items: flex-end; margin: 4px 0 18px; }
+        .brand-wrap {
+            display: flex; justify-content: space-between; align-items: center;
+            gap: 16px 20px; margin: 4px 0 18px; flex-wrap: wrap;
+        }
+        .brand-copy { flex: 1 1 16rem; min-width: min(100%, 16rem); }
         .brand-mark { font-family: Fraunces, serif; font-size: 2.1rem; font-weight: 700; color: var(--text); line-height: 1; }
         .brand-mark span { color: var(--copper); }
         .brand-kicker { color: var(--muted); font-size: 0.92rem; margin-top: 8px; max-width: 620px; }
+        .brand-actions { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
         .desk-chip {
+            display: inline-flex; align-items: center; box-sizing: border-box;
+            height: 38px;
             font-family: "IBM Plex Mono", monospace;
-            font-size: 0.78rem;
-            border: 1px solid var(--line);
-            padding: 8px 12px;
+            font-size: 12px;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            line-height: 1;
+            border: 1px solid var(--chip-line);
+            padding: 10px 14px;
             border-radius: 999px;
-            color: var(--muted);
+            color: var(--chip-text);
             white-space: nowrap;
         }
+        a.help-link {
+            display: inline-flex; align-items: center; gap: 8px; box-sizing: border-box;
+            height: 38px;
+            background: var(--help-surface);
+            border: 1px solid var(--help-line);
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-family: Outfit, system-ui, sans-serif;
+            font-size: 13px;
+            font-weight: 500;
+            line-height: 1;
+            color: var(--text);
+            text-decoration: none;
+            white-space: nowrap;
+        }
+        a.help-link::before {
+            content: "";
+            width: 16px; height: 16px; flex-shrink: 0;
+            background: currentColor;
+            -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='black' d='M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z'/%3E%3C/svg%3E") center / contain no-repeat;
+            mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='black' d='M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z'/%3E%3C/svg%3E") center / contain no-repeat;
+        }
+        a.help-link:hover { background: var(--help-hover); color: var(--text); }
+        a.help-link:focus-visible { outline: 2px solid var(--chip-text); outline-offset: 2px; }
         .status-bar {
             display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
             border: 1px solid var(--line); background: var(--panel);
@@ -149,6 +201,15 @@ def inject_css() -> None:
         .briefing-card h4 { margin: 0 0 8px; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-family: Outfit, sans-serif; }
         .briefing-card p { margin: 0; color: var(--text); font-size: 0.92rem; line-height: 1.45; }
         @media (max-width: 900px) { .briefing-grid { grid-template-columns: 1fr; } }
+        .summary-card {
+            background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--mint);
+            border-radius: 12px; padding: 12px 16px; margin: 4px 0 6px;
+        }
+        .summary-card h4 {
+            margin: 0 0 6px; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em;
+            color: var(--mint); font-family: Outfit, sans-serif;
+        }
+        .summary-card p { margin: 0; line-height: 1.5; font-size: 0.95rem; }
         .empty-panel {
             border: 1px dashed var(--line);
             border-radius: 12px;
@@ -156,6 +217,22 @@ def inject_css() -> None:
             color: var(--muted);
             background: #101410;
         }
+        .research-hero {
+            background: linear-gradient(160deg, #1c241c 0%, #151a16 55%);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 22px 24px 8px;
+            margin-bottom: 8px;
+        }
+        .research-kicker {
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.72rem;
+            letter-spacing: 0.12em;
+            color: var(--copper);
+            margin-bottom: 6px;
+        }
+        .research-hero h3 { margin: 0 0 8px; }
+        .research-hero p { color: var(--muted); margin: 0 0 14px; max-width: 720px; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -164,8 +241,9 @@ def inject_css() -> None:
 
 def metric_card(label: str, value: str, sub: str = "", tone: str = "") -> str:
     cls = f"metric-card {tone}".strip()
+    tip = METRIC_HELP.get(label, "")
     return (
-        f'<div class="{cls}">'
+        f'<div class="{cls}" title="{escape(tip)}">'
         f'<div class="metric-label">{escape(label)}</div>'
         f'<div class="metric-value">{value}</div>'
         f'<div class="metric-sub">{escape(sub)}</div>'
@@ -370,20 +448,56 @@ def desk_verdict(metrics: dict, pair: str) -> str:
     return core + clock
 
 
+def render_summary(view: str) -> None:
+    summary = st.session_state.get("summaries", {}).get(view)
+    if not summary:
+        return
+    st.markdown(
+        f'<div class="summary-card"><h4>AI Report</h4><p>{escape(summary["text"])}</p></div>',
+        unsafe_allow_html=True,
+    )
+    note_col, button_col = st.columns([6, 1], vertical_alignment="center")
+    with note_col:
+        if summary.get("source"):
+            st.caption(f"AI Report by {summary['source']}, from the figures in this view. Check them against the tables.")
+        elif summary.get("error"):
+            st.caption(f"AI Report unavailable ({summary['error']}). Showing the rule-based report.")
+    with button_col:
+        context = st.session_state.get("summary_contexts", {}).get(view)
+        if context and st.button("Regenerate", key=f"refresh_{view}", icon=":material/refresh:"):
+            refresh_summary(view, context)
+            st.rerun()
+
+
+def refresh_summary(view: str, context: dict) -> None:
+    with st.spinner("Writing the AI Report..."):
+        st.session_state.setdefault("summaries", {})[view] = generate_view_summary(view, context)
+    st.session_state.setdefault("summary_contexts", {})[view] = context
+
+
+def ask_research(prompt: str, context: dict) -> None:
+    st.session_state.ai_messages.append({"role": "user", "content": prompt})
+    llm = call_llm(st.session_state.ai_messages, context, task="research")
+    reply = llm.content if llm.ok else (llm.error or "AI request failed.")
+    st.session_state.ai_messages.append({"role": "assistant", "content": reply})
+
+
 st.set_page_config(page_title="TETHER · RelVal Desk", layout="wide", page_icon="⚓")
 inject_css()
 
-st.markdown(
+st.html(
     """
     <div class="brand-wrap">
-      <div>
+      <div class="brand-copy">
         <div class="brand-mark">TE<span>THER</span></div>
         <div class="brand-kicker">Market-neutral pairs desk. You do not trade two stocks — you trade whether their tether is still holding.</div>
       </div>
-      <div class="desk-chip">RELVAL · STAT ARB</div>
+      <div class="brand-actions">
+        <div class="desk-chip">RELVAL · STAT ARB</div>
+        <a class="help-link" href="guide" title="Open the guide: what the app does and what every chart means">Help</a>
+      </div>
     </div>
-    """,
-    unsafe_allow_html=True,
+    """
 )
 
 with st.sidebar:
@@ -403,20 +517,68 @@ with st.sidebar:
     )
     asset_a = ticker_from_label(asset_a_label)
     asset_b = ticker_from_label(asset_b_label)
-    benchmark = st.selectbox("Factor sleeve", BENCHMARKS, index=0, key="benchmark")
+    benchmark = st.selectbox(
+        "Factor sleeve",
+        BENCHMARKS,
+        index=0,
+        key="benchmark",
+        help="The index used to measure how much market exposure (beta) the long-short book still carries.",
+    )
 
     st.markdown("**Window**")
     start_date = st.date_input("Start", date(2019, 1, 1), key="start_date")
     end_date = st.date_input("End", date.today(), key="end_date")
-    walk_forward = st.checkbox("Walk-forward (no peeking)", value=True, key="walk_forward")
-    split_date = st.date_input("Discover / trade split", date(2024, 1, 1), key="split_date")
+    walk_forward = st.checkbox(
+        "Walk-forward (no peeking)",
+        value=True,
+        key="walk_forward",
+        help="Learn the relationship before the split date, then trade only after it with those rules frozen.",
+    )
+    split_date = st.date_input(
+        "Discover / trade split",
+        date(2024, 1, 1),
+        key="split_date",
+        help="Data before this date is discovery (in-sample); after it is live trading (out-of-sample).",
+    )
     st.caption("Discover hedge and tether on or before the split. Trade only after it.")
 
     st.markdown("**Signals**")
-    lookback = st.slider("Lookback (days)", min_value=20, max_value=180, value=60, step=10, key="lookback")
-    entry_z = st.slider("Entry |z|", min_value=1.0, max_value=4.0, value=2.0, step=0.1, key="entry_z")
-    exit_z = st.slider("Exit |z|", min_value=0.1, max_value=2.0, value=0.5, step=0.1, key="exit_z")
-    stop_loss = st.slider("Stop |z|", min_value=1.0, max_value=5.0, value=3.0, step=0.1, key="stop_loss")
+    lookback = st.slider(
+        "Lookback (days)",
+        min_value=20,
+        max_value=180,
+        value=60,
+        step=10,
+        key="lookback",
+        help="Window for the spread's rolling average and volatility that the z-score is measured against.",
+    )
+    entry_z = st.slider(
+        "Entry |z|",
+        min_value=1.0,
+        max_value=4.0,
+        value=2.0,
+        step=0.1,
+        key="entry_z",
+        help="Open a trade when the spread is this many standard deviations from its average.",
+    )
+    exit_z = st.slider(
+        "Exit |z|",
+        min_value=0.1,
+        max_value=2.0,
+        value=0.5,
+        step=0.1,
+        key="exit_z",
+        help="Close the trade once the spread is back within this many standard deviations.",
+    )
+    stop_loss = st.slider(
+        "Stop |z|",
+        min_value=1.0,
+        max_value=5.0,
+        value=3.0,
+        step=0.1,
+        key="stop_loss",
+        help="Cut the trade if the spread keeps widening past this level: the relationship may have broken.",
+    )
 
     st.markdown("**Book**")
     hedge_method = st.selectbox("Hedge", HEDGE_METHODS, key="hedge_method")
@@ -424,9 +586,20 @@ with st.sidebar:
     capital = st.number_input(
         "Gross capital ($)", min_value=10_000.0, max_value=10_000_000.0, value=100_000.0, step=10_000.0, key="capital"
     )
-    sizing_method = st.selectbox("Sizing", SIZING_METHODS, key="sizing_method")
+    sizing_method = st.selectbox(
+        "Sizing",
+        SIZING_METHODS,
+        key="sizing_method",
+        help="Hedge Ratio splits capital to match the hedge ratio; Equal Dollar puts the same dollars on each side.",
+    )
     max_leg_pct = st.number_input(
-        "Max per leg (% of gross)", min_value=50, max_value=100, value=75, step=5, key="max_leg_pct"
+        "Max per leg (% of gross)",
+        min_value=50,
+        max_value=100,
+        value=75,
+        step=5,
+        key="max_leg_pct",
+        help="No single stock may take more than this share of capital. Both legs shrink together when it binds.",
     )
     charge_borrow = st.checkbox("Charge stock-borrow on shorts", value=True, key="charge_borrow")
     borrow_bps = st.number_input(
@@ -439,7 +612,13 @@ with st.sidebar:
         disabled=not charge_borrow,
     )
     st.caption("10 bps slippage + 5 bps commission on traded notional. Borrow is an annualized rate on short dollars.")
-    run_button = st.button("Run the book", type="primary", use_container_width=True)
+    run_button = st.button("Run the book", type="primary", width="stretch")
+
+    ai_labels = [provider.label for provider, _ in configured_providers()]
+    if ai_labels:
+        st.caption("AI summaries: " + " → ".join(ai_labels))
+    else:
+        st.caption("AI summaries are off: no API key found. Open Help → AI summaries to add one.")
 
 if "ai_messages" not in st.session_state:
     st.session_state.ai_messages = []
@@ -484,10 +663,12 @@ if run_button and asset_a != asset_b and start_date < end_date:
     st.session_state["book_context"] = build_book_context(result)
     st.session_state.ai_messages = []
     if not result["data"].empty:
-        with st.spinner("Groq is writing the desk briefing from this book..."):
+        with st.spinner("Writing the desk briefing from this book..."):
             st.session_state["desk_briefing"] = generate_desk_briefing(st.session_state["book_context"])
+        refresh_summary("tape", build_tape_context(result, entry_z, exit_z, stop_loss))
     else:
         st.session_state["desk_briefing"] = None
+        st.session_state.get("summaries", {}).pop("tape", None)
 
     if result["data"].empty:
         st.error("No prices for that ticket and window.")
@@ -539,6 +720,13 @@ with main_tabs[0]:
             )
         st.session_state["screen_table"] = screen_table
         st.session_state["screen_sector_used"] = sector
+        if not screen_table.empty:
+            refresh_summary(
+                "universe",
+                build_universe_context(screen_table, sector, split_date.isoformat() if walk_forward else None),
+            )
+        else:
+            st.session_state.get("summaries", {}).pop("universe", None)
 
     screen_table = st.session_state.get("screen_table")
     if screen_table is None:
@@ -553,6 +741,7 @@ with main_tabs[0]:
         n_fdr = int(screen_table["fdr_significant"].sum()) if "fdr_significant" in screen_table else 0
         n_died = int(screen_table["tether_died"].sum()) if "tether_died" in screen_table else 0
         n_tethered = int((screen_table["tether_state"] == "TETHERED").sum())
+        render_summary("universe")
         st.caption(
             f"{n_fdr} of {len(screen_table)} pairs survive FDR. "
             f"{n_coint} raw p-values sit under the uncorrected line. "
@@ -562,7 +751,7 @@ with main_tabs[0]:
             screen_table, value_col="p_value_fdr" if "p_value_fdr" in screen_table.columns else "p_value"
         )
         if not heat.empty:
-            st.plotly_chart(build_heatmap(heat), use_container_width=True)
+            st.plotly_chart(build_heatmap(heat), width="stretch")
         display = screen_table.copy()
         display["p_value"] = display["p_value"].map(lambda x: f"{x:.4f}")
         if "p_value_fdr" in display.columns:
@@ -573,7 +762,7 @@ with main_tabs[0]:
         cols = ["pair", "tether_state", "tether_score", "p_value", "p_value_fdr", "fdr_significant", "half_life"]
         if "oos_tether_state" in display.columns:
             cols.extend(["oos_tether_state", "tether_died"])
-        st.dataframe(display[[c for c in cols if c in display.columns]], use_container_width=True, hide_index=True)
+        st.dataframe(display[[c for c in cols if c in display.columns]], width="stretch", hide_index=True)
         pair_options = screen_table["pair"].tolist()
         chosen_pair = st.selectbox("Load into the ticket", pair_options, key="screen_pair_choice")
         if st.button("Load pair"):
@@ -604,7 +793,9 @@ with main_tabs[1]:
                 unsafe_allow_html=True,
             )
         if briefing.get("error"):
-            st.caption(f"Groq briefing unavailable: {briefing['error']}. Showing the rule-based verdict.")
+            st.caption(f"AI briefing unavailable: {briefing['error']}. Showing the rule-based verdict.")
+        elif briefing.get("source"):
+            st.caption(f"Briefing written by {briefing['source']} from this book's numbers.")
         pnl_tone = "tone-mint" if metrics["total_pnl"] >= 0 else "tone-rose"
         state_tone = {"TETHERED": "tone-mint", "WEAK": "tone-copper", "BROKEN": "tone-rose"}.get(
             metrics["tether_state"], ""
@@ -652,7 +843,7 @@ with main_tabs[1]:
             wf_view = wf.copy()
             wf_view["Sharpe"] = wf_view["Sharpe"].map(lambda v: "—" if pd.isna(v) else f"{v:.2f}")
             wf_view["Return"] = wf_view["Return"].map(lambda v: "—" if pd.isna(v) else f"{v:.1%}")
-            st.dataframe(wf_view, hide_index=True, use_container_width=True)
+            st.dataframe(wf_view, hide_index=True, width="stretch")
             is_s, oos_s = metrics.get("is_sharpe"), metrics.get("oos_sharpe")
             if pd.notna(is_s) and pd.notna(oos_s) and oos_s < is_s:
                 st.caption(
@@ -683,17 +874,17 @@ with main_tabs[1]:
                     "OOS Sharpe": cost_grid["oos_sharpe"].map(lambda v: fmt_num(v)),
                 }
             )
-            st.dataframe(grid_view, hide_index=True, use_container_width=True)
+            st.dataframe(grid_view, hide_index=True, width="stretch")
             st.caption("Same signals, different slippage. If the edge disappears at 5 bps, it was never there.")
 
         left, right = st.columns([1.15, 1])
         with left:
             rolling_p = result.get("rolling_p_value", pd.Series(dtype=float))
             if rolling_p is not None and len(rolling_p):
-                st.plotly_chart(build_tether_chart(rolling_p), use_container_width=True)
+                st.plotly_chart(build_tether_chart(rolling_p), width="stretch")
             net_beta = result.get("net_beta")
             if net_beta is not None and len(net_beta):
-                st.plotly_chart(build_net_beta_chart(net_beta), use_container_width=True)
+                st.plotly_chart(build_net_beta_chart(net_beta), width="stretch")
             else:
                 st.caption("Need a longer window to plot rolling tether health.")
             st.caption(
@@ -726,7 +917,7 @@ with main_tabs[1]:
                         "reason": "How",
                     }
                 )
-                st.dataframe(view, use_container_width=True, hide_index=True)
+                st.dataframe(view, width="stretch", hide_index=True)
                 st.caption(
                     "vs HL is holding time divided by the spread half-life. Stops are relationship failures, not noise."
                 )
@@ -743,14 +934,15 @@ with main_tabs[1]:
 
 with main_tabs[2]:
     if show_results:
+        render_summary("tape")
         chart_a = result["asset_a"]
         chart_b = result["asset_b"]
         c1, c2 = st.columns([1.4, 1])
         with c1:
             st.plotly_chart(
-                build_price_chart(result["log_prices"], chart_a, chart_b, result["positions"]), use_container_width=True
+                build_price_chart(result["log_prices"], chart_a, chart_b, result["positions"]), width="stretch"
             )
-            st.plotly_chart(build_spread_chart(result["spread"], result["spread_mean"]), use_container_width=True)
+            st.plotly_chart(build_spread_chart(result["spread"], result["spread_mean"]), width="stretch")
             st.plotly_chart(
                 build_returns_chart(
                     result["strategy_returns"],
@@ -758,10 +950,10 @@ with main_tabs[2]:
                     result["pair_buy_hold_cumulative"],
                     result["benchmark"],
                 ),
-                use_container_width=True,
+                width="stretch",
             )
         with c2:
-            st.plotly_chart(build_zscore_chart(result["zscore"], entry_z, exit_z, stop_loss), use_container_width=True)
+            st.plotly_chart(build_zscore_chart(result["zscore"], entry_z, exit_z, stop_loss), width="stretch")
             st.markdown(
                 f"**{chart_a}/{chart_b}** · {result['sizing_method']} · lookback {lookback}d · entry {entry_z:g} / exit {exit_z:g} / stop {stop_loss:g}"
             )
@@ -774,31 +966,47 @@ with main_tabs[2]:
 
 with main_tabs[3]:
     context = st.session_state.get("book_context")
-    if not show_results or not context:
-        st.markdown(
-            '<div class="empty-panel">Research is grounded in the last book. Run a ticket first, then ask why the tether scored the way it did.</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.caption(
-            f"Grounded on {context['pair']} · {context['metrics'].get('tether_state')} · "
-            f"score {context['metrics'].get('tether_score')} · {len(context.get('blotter') or [])} round-trips. "
-            "Groq only sees this book JSON, not the open web."
-        )
+    ready = bool(show_results and context)
+    pair_line = (
+        f"{context['pair']} · {context['metrics'].get('tether_state')} · "
+        f"score {context['metrics'].get('tether_score')} · {len(context.get('blotter') or [])} completed trades"
+        if ready
+        else "No book loaded yet"
+    )
+    st.markdown(
+        f"""
+        <div class="research-hero">
+          <div class="research-kicker">RESEARCH</div>
+          <h3>Ask this book a question</h3>
+          <p>Answers use only the ticket you just ran: the statistical tests, the trade list, and the profit and loss.
+          Nothing is looked up on the web. {pair_line}.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    prompts = [
+        "Is this pair actually tied together, or only moving in the same direction?",
+        "Did the live period confirm what the discovery period suggested?",
+        "Which trades were cut by the stop, and what does that say about the relationship?",
+    ]
+    if ready:
+        prompt_cols = st.columns(3)
+        for index, question in enumerate(prompts):
+            if prompt_cols[index].button(question, key=f"research_prompt_{index}", width="stretch"):
+                with st.spinner("Reading this book's figures..."):
+                    ask_research(question, context)
+                st.rerun()
         for message in st.session_state.ai_messages:
             with st.chat_message(message["role"]):
                 st.write(message["content"])
-        if prompt := st.chat_input("Ask about this book: tether, half-life, blotter, PnL, stops..."):
-            st.session_state.ai_messages.append({"role": "user", "content": prompt})
-            with st.spinner("Groq is reading the active book context..."):
-                llm = call_llm(st.session_state.ai_messages, context, task="research")
-            if llm.ok:
-                st.session_state.ai_messages.append({"role": "assistant", "content": llm.content})
-            else:
-                st.session_state.ai_messages.append(
-                    {"role": "assistant", "content": llm.error or "Groq request failed."}
-                )
+        if prompt := st.chat_input("Ask about the tether, the half-life, a trade, or the profit and loss"):
+            with st.spinner("Reading this book's figures..."):
+                ask_research(prompt, context)
             st.rerun()
-        if st.button("Clear research"):
+        if st.session_state.ai_messages and st.button("Clear conversation"):
             st.session_state.ai_messages = []
             st.rerun()
+    else:
+        for question in prompts:
+            st.markdown(f'<div class="briefing-card" style="margin-bottom:10px"><p>{question}</p></div>', unsafe_allow_html=True)
+        st.caption("Run the book from the sidebar. These questions become buttons once a ticket has results.")

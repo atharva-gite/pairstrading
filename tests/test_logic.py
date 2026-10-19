@@ -165,8 +165,8 @@ def test_call_llm_sends_book_context(monkeypatch):
                     return FakeResponse()
 
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
-    monkeypatch.setenv("LLM_PROVIDER", "groq")
-    monkeypatch.setattr("src.llm.GROQ_CLIENT_FACTORY", lambda api_key: FakeClient())
+    monkeypatch.setenv("LLM_PROVIDERS", "groq")
+    monkeypatch.setattr("src.llm.LLM_CLIENT_FACTORY", lambda **_: FakeClient())
     result = call_llm(
         [{"role": "user", "content": "Is the tether intact?"}],
         {"pair": "KO/PEP", "metrics": {"tether_state": "TETHERED"}},
@@ -196,7 +196,8 @@ def test_generate_desk_briefing_parses_json(monkeypatch):
                     return FakeResponse()
 
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
-    monkeypatch.setattr("src.llm.GROQ_CLIENT_FACTORY", lambda api_key: FakeClient())
+    monkeypatch.setenv("LLM_PROVIDERS", "groq")
+    monkeypatch.setattr("src.llm.LLM_CLIENT_FACTORY", lambda **_: FakeClient())
     briefing = generate_desk_briefing({"pair": "KO/PEP"})
     assert briefing["headline"] == "H"
     assert briefing["verdict"] == "V"

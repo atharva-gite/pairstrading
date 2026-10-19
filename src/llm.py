@@ -1,4 +1,9 @@
-"""Groq desk briefing and research chat, grounded in the book context."""
+"""LLM transport for the desk briefing, Research chat and view summaries.
+
+Every supported provider exposes an OpenAI-compatible chat endpoint, so one
+client covers all of them. Providers with a key are tried in order; a rate
+limit or outage on one falls through to the next.
+"""
 
 from __future__ import annotations
 
@@ -16,23 +21,67 @@ from dotenv import load_dotenv
 
 from src.stats import MAX_TRADABLE_HALF_LIFE
 
+
+@dataclass(frozen=True)
+class Provider:
+    name: str
+    label: str
+    key_env: str
+    base_url: str
+    model: str
+    fallback_model: str | None = None
+
+    @property
+    def model_env(self) -> str:
+        return f"{self.name.upper()}_MODEL"
+
+
+PROVIDERS: dict[str, Provider] = {
+    p.name: p
+    for p in [
+        Provider(
+            "groq",
+            "Groq",
+            "GROQ_API_KEY",
+            "https://api.groq.com/openai/v1",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+        ),
+        Provider(
+            "gemini",
+            "Google Gemini",
+            "GEMINI_API_KEY",
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ),
+        Provider(
+            "cerebras", "Cerebras", "CEREBRAS_API_KEY", "https://api.cerebras.ai/v1", "gpt-oss-120b", "llama3.1-8b"
+        ),
+        Provider("mistral", "Mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1", "mistral-small-latest"),
+        Provider(
+            "openrouter",
+            "OpenRouter",
+            "OPENROUTER_API_KEY",
+            "https://openrouter.ai/api/v1",
+            "openai/gpt-oss-20b:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+        ),
+        Provider(
+            "github",
+            "GitHub Models",
+            "GITHUB_MODELS_TOKEN",
+            "https://models.github.ai/inference",
+            "openai/gpt-4.1-mini",
+        ),
+    ]
+}
+
+LLM_PROVIDERS_ENV = "LLM_PROVIDERS"
 LLM_PROVIDER_ENV = "LLM_PROVIDER"
+DEFAULT_PROVIDER_ORDER = ["groq", "gemini", "cerebras", "mistral", "openrouter", "github"]
 
-
-LLM_MODEL_ENV = "GROQ_MODEL"
-
-
-DEFAULT_LLM_PROVIDER = "groq"
-
-
-GROQ_MODEL_PRIMARY = "openai/gpt-oss-20b"
-
-
-GROQ_MODEL_FALLBACK = "openai/gpt-oss-120b"
-
-
-GROQ_CLIENT_FACTORY = None
-
+LLM_CLIENT_FACTORY: Callable[..., Any] | None = None
 
 RESEARCH_SYSTEM = (
     "You are the research analyst on TETHER, a market-neutral pairs desk. "
@@ -43,7 +92,6 @@ RESEARCH_SYSTEM = (
     "Be specific, concise, and use the actual pair and numbers from context."
 )
 
-
 DESK_BRIEFING_SYSTEM = (
     "You are the PM on TETHER. Write a briefing from ACTIVE_BOOK_CONTEXT_JSON only. "
     "Return JSON with keys headline, verdict, drivers, risks. No markdown. "
@@ -53,6 +101,17 @@ DESK_BRIEFING_SYSTEM = (
     "If tether_state is BROKEN, lead with that. "
     "If half_life > 60, say the OU clock is too slow to use on-time exits as evidence."
 )
+
+TASK_SYSTEMS = {"briefing": DESK_BRIEFING_SYSTEM, "research": RESEARCH_SYSTEM}
+
+
+@dataclass
+class LLMResult:
+    ok: bool
+    content: str
+    error: str | None = None
+    provider: str | None = None
+    model: str | None = None
 
 
 def _load_project_dotenv() -> None:
@@ -144,70 +203,100 @@ def parse_desk_briefing(text: str) -> dict | None:
     }
 
 
-@dataclass
-class LLMResult:
-    ok: bool
-    content: str
-    error: str | None = None
-
-
-def resolve_groq_api_key(
+def resolve_api_key(
+    env_var: str,
     secrets_getter: Callable[[str], object | None] | None = None,
-) -> tuple[str | None, str]:
+) -> str | None:
     _load_project_dotenv()
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = (os.getenv(env_var) or "").strip().strip('"')
     if api_key:
-        return api_key.strip().strip('"'), ".env"
-
+        return api_key
     if secrets_getter is not None:
         try:
-            secret_value = secrets_getter("GROQ_API_KEY")
+            secret_value = secrets_getter(env_var)
         except Exception:
             secret_value = None
         if secret_value:
-            return str(secret_value), "st.secrets"
-    return None, "not found"
+            return str(secret_value)
+    return None
+
+
+def provider_order() -> tuple[list[Provider], list[str]]:
+    """Providers to try, in order, plus any unknown names from the environment."""
+    _load_project_dotenv()
+    raw = os.getenv(LLM_PROVIDERS_ENV) or ""
+    if raw.strip():
+        names = [n.strip().lower() for n in raw.split(",") if n.strip()]
+    else:
+        preferred = (os.getenv(LLM_PROVIDER_ENV) or "").strip().lower()
+        names = ([preferred] if preferred else []) + [n for n in DEFAULT_PROVIDER_ORDER if n != preferred]
+    unknown = [n for n in names if n not in PROVIDERS]
+    return [PROVIDERS[n] for n in names if n in PROVIDERS], unknown
+
+
+def configured_providers() -> list[tuple[Provider, str]]:
+    ordered, _ = provider_order()
+    pairs = []
+    for provider in ordered:
+        key = resolve_api_key(provider.key_env)
+        if key:
+            pairs.append((provider, key))
+    return pairs
+
+
+def missing_key_message() -> str:
+    keys = ", ".join(PROVIDERS[n].key_env for n in DEFAULT_PROVIDER_ORDER)
+    return f"No AI key found. Add one of {keys} to .env."
 
 
 def call_llm(
     messages: list[dict[str, str]],
     context: str | dict[str, object],
     task: str = "research",
+    system: str | None = None,
+    context_label: str = "ACTIVE_BOOK_CONTEXT_JSON",
 ) -> LLMResult:
-    _load_project_dotenv()
-    provider = os.getenv(LLM_PROVIDER_ENV, DEFAULT_LLM_PROVIDER).lower()
-    if provider != "groq":
-        return LLMResult(False, "", f"Unsupported LLM_PROVIDER '{provider}'. Set LLM_PROVIDER=groq.")
-    api_key, key_source = resolve_groq_api_key()
-    if not api_key:
-        return LLMResult(False, "", "GROQ_API_KEY is missing. Add it to .env.")
-    if key_source == "st.secrets":
-        os.environ.setdefault("GROQ_API_KEY", api_key)
-    model = os.getenv(LLM_MODEL_ENV, GROQ_MODEL_PRIMARY)
+    _, unknown = provider_order()
+    if unknown:
+        choices = ", ".join(PROVIDERS)
+        return LLMResult(False, "", f"Unsupported LLM provider {', '.join(unknown)}. Choose from: {choices}.")
+    available = configured_providers()
+    if not available:
+        return LLMResult(False, "", missing_key_message())
+
     context_text = context if isinstance(context, str) else serialize_book_context(context)
-    system = DESK_BRIEFING_SYSTEM if task == "briefing" else RESEARCH_SYSTEM
+    system_text = system or TASK_SYSTEMS.get(task, RESEARCH_SYSTEM)
     input_messages = [
-        {"role": "system", "content": f"{system}\n\nACTIVE_BOOK_CONTEXT_JSON:\n{context_text}"},
+        {"role": "system", "content": f"{system_text}\n\n{context_label}:\n{context_text}"},
         *messages,
     ]
-    try:
-        client = _get_groq_client(api_key)
-        response = _create_groq_chat_completion(client, model, input_messages)
+    errors = []
+    for provider, api_key in available:
+        result = _call_provider(provider, api_key, input_messages)
+        if result.ok:
+            return result
+        errors.append(f"{provider.label}: {result.error}")
+    if len(errors) == 1:
+        return LLMResult(False, "", errors[0])
+    return LLMResult(False, "", "All AI providers failed. " + " | ".join(errors))
+
+
+def _call_provider(provider: Provider, api_key: str, input_messages: list[dict[str, str]]) -> LLMResult:
+    primary = os.getenv(provider.model_env) or provider.model
+    models = [primary] + ([provider.fallback_model] if provider.fallback_model not in (None, primary) else [])
+    client = _get_client(provider, api_key)
+    for i, model in enumerate(models):
+        try:
+            response = client.chat.completions.create(model=model, messages=input_messages, temperature=0.2)
+        except Exception as exc:
+            if _is_model_not_found(exc) and i + 1 < len(models):
+                continue
+            return LLMResult(False, "", f"request failed: {_describe_error(exc)}", provider.label, model)
         content = response.choices[0].message.content
         if not content:
-            return LLMResult(False, "", "Groq returned an empty response.")
-        return LLMResult(True, str(content))
-    except Exception as exc:
-        if _is_groq_model_not_found(exc) and model != GROQ_MODEL_FALLBACK:
-            try:
-                response = _create_groq_chat_completion(client, GROQ_MODEL_FALLBACK, input_messages)
-                content = response.choices[0].message.content
-                if not content:
-                    return LLMResult(False, "", "Groq returned an empty response.")
-                return LLMResult(True, str(content))
-            except Exception as fallback_exc:
-                return LLMResult(False, "", f"Groq request failed: {fallback_exc}")
-        return LLMResult(False, "", f"Groq request failed: {exc}")
+            return LLMResult(False, "", "returned an empty response.", provider.label, model)
+        return LLMResult(True, str(content), None, provider.label, model)
+    return LLMResult(False, "", "no model available.", provider.label)
 
 
 def generate_desk_briefing(context: dict) -> dict:
@@ -217,8 +306,9 @@ def generate_desk_briefing(context: dict) -> dict:
         task="briefing",
     )
     if not result.ok:
-        return {"headline": "", "verdict": "", "drivers": "", "risks": "", "error": result.error}
+        return {"headline": "", "verdict": "", "drivers": "", "risks": "", "error": result.error, "source": None}
     parsed = parse_desk_briefing(result.content)
+    source = f"{result.provider} · {result.model}"
     if not parsed or not parsed.get("verdict"):
         return {
             "headline": "",
@@ -226,31 +316,53 @@ def generate_desk_briefing(context: dict) -> dict:
             "drivers": "",
             "risks": "",
             "error": None,
+            "source": source,
         }
     parsed["error"] = None
+    parsed["source"] = source
     return parsed
 
 
-def _create_groq_chat_completion(client, model: str, input_messages: list[dict[str, str]]):
-    return client.chat.completions.create(model=model, messages=input_messages, temperature=0.2)
-
-
-def _is_groq_model_not_found(exc: Exception) -> bool:
+def _status_code(exc: Exception) -> int | None:
     status_code = getattr(exc, "status_code", None)
     response = getattr(exc, "response", None)
     if status_code is None and response is not None:
         status_code = getattr(response, "status_code", None)
-    if status_code != 404:
+    return status_code
+
+
+def _describe_error(exc: Exception) -> str:
+    """One short phrase for the UI; provider error bodies can run to several hundred characters."""
+    code = _status_code(exc)
+    if code == 429:
+        return "rate limited (free-tier quota), try again in a minute"
+    if code in (401, 403):
+        return "API key rejected"
+    if code is not None and code >= 500:
+        return f"provider error (HTTP {code})"
+    if code is not None:
+        return f"HTTP {code}"
+    message = str(exc).strip() or type(exc).__name__
+    return message if len(message) <= 120 else message[:117] + "..."
+
+
+def _is_model_not_found(exc: Exception) -> bool:
+    status_code = _status_code(exc)
+    if status_code not in (400, 404):
         return False
     message = str(exc).lower()
     return "model" in message and (
-        "not found" in message or "does not exist" in message or "model_not_found" in message
+        "not found" in message
+        or "does not exist" in message
+        or "model_not_found" in message
+        or "not a valid model" in message
+        or "no endpoints" in message
     )
 
 
-def _get_groq_client(api_key: str):
-    if GROQ_CLIENT_FACTORY is not None:
-        return GROQ_CLIENT_FACTORY(api_key=api_key)
-    from groq import Groq
+def _get_client(provider: Provider, api_key: str):
+    if LLM_CLIENT_FACTORY is not None:
+        return LLM_CLIENT_FACTORY(provider=provider, api_key=api_key)
+    from openai import OpenAI
 
-    return Groq(api_key=api_key)
+    return OpenAI(api_key=api_key, base_url=provider.base_url, max_retries=1, timeout=45)
