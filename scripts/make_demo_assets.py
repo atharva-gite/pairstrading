@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build docs/assets/tether.gif (~20s) and the research-note PDF."""
+
 from __future__ import annotations
 
 from pathlib import Path

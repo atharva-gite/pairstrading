@@ -1,5 +1,5 @@
-from pathlib import Path
 import re
+from pathlib import Path
 
 
 def test_sidebar_slider_controls_are_defined_once_with_keys():

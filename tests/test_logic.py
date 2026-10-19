@@ -1,8 +1,10 @@
 import numpy as np
 import pandas as pd
+
 from src.logic import (
     PairsTradingEngine,
     apply_kalman_filter,
+    apply_multiple_testing,
     build_signals,
     build_trade_blotter,
     calculate_half_life,
@@ -12,7 +14,6 @@ from src.logic import (
     dollar_notionals,
     generate_desk_briefing,
     parse_desk_briefing,
-    apply_multiple_testing,
     screen_sector_pairs,
 )
 
@@ -258,4 +259,3 @@ def test_borrow_reduces_pnl_when_short():
     cheap_pnl = cheap.run_backtest()["metrics"]["total_pnl"]
     rich_pnl = rich.run_backtest()["metrics"]["total_pnl"]
     assert rich_pnl <= cheap_pnl + 1e-6
-

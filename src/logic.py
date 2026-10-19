@@ -3,15 +3,16 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import statsmodels.api as sm
+import yfinance as yf
 from dotenv import load_dotenv
 from statsmodels.stats.multitest import multipletests
 from statsmodels.tsa.stattools import adfuller, coint
@@ -235,12 +236,8 @@ def compute_beta_ratio(
     combined_a = pd.concat([asset_a_returns, benchmark_returns], axis=1).dropna()
     combined_b = pd.concat([asset_b_returns, benchmark_returns], axis=1).dropna()
 
-    beta_a = float(
-        sm.OLS(combined_a.iloc[:, 0], sm.add_constant(combined_a.iloc[:, 1])).fit().params.iloc[-1]
-    )
-    beta_b = float(
-        sm.OLS(combined_b.iloc[:, 0], sm.add_constant(combined_b.iloc[:, 1])).fit().params.iloc[-1]
-    )
+    beta_a = float(sm.OLS(combined_a.iloc[:, 0], sm.add_constant(combined_a.iloc[:, 1])).fit().params.iloc[-1])
+    beta_b = float(sm.OLS(combined_b.iloc[:, 0], sm.add_constant(combined_b.iloc[:, 1])).fit().params.iloc[-1])
     ratio = float(beta_a / beta_b) if not np.isclose(beta_b, 0.0) else float("nan")
 
     return {
@@ -466,16 +463,6 @@ def tether_from_prices(series_a: pd.Series, series_b: pd.Series) -> dict:
         "half_life": half_life,
         **tether,
     }
-    if screen_table.empty:
-        return pd.DataFrame()
-    tickers = sorted(set(screen_table["asset_a"]) | set(screen_table["asset_b"]))
-    matrix = pd.DataFrame(np.nan, index=tickers, columns=tickers)
-    for _, row in screen_table.iterrows():
-        matrix.loc[row["asset_a"], row["asset_b"]] = row["p_value"]
-        matrix.loc[row["asset_b"], row["asset_a"]] = row["p_value"]
-    for ticker in tickers:
-        matrix.loc[ticker, ticker] = 0.0
-    return matrix
 
 
 def dollar_notionals(
@@ -614,7 +601,7 @@ class PairsTradingEngine:
         self.borrow_bps = float(borrow_bps)
         self.data = pd.DataFrame()
 
-    def fetch(self) -> "PairsTradingEngine":
+    def fetch(self) -> PairsTradingEngine:
         tickers = [self.asset_a, self.asset_b]
         if self.benchmark not in tickers:
             tickers.append(self.benchmark)
@@ -631,9 +618,7 @@ class PairsTradingEngine:
 
         is_mask, split_ts = split_masks(closes.index, self.split_date)
         oos_mask = ~is_mask
-        walk_forward_applied = bool(
-            self.walk_forward and is_mask.sum() >= 60 and oos_mask.sum() >= 40
-        )
+        walk_forward_applied = bool(self.walk_forward and is_mask.sum() >= 60 and oos_mask.sum() >= 40)
         discovery_closes = closes.loc[is_mask] if walk_forward_applied else closes
         live_closes = closes.loc[oos_mask] if walk_forward_applied else pd.DataFrame()
 
@@ -702,9 +687,7 @@ class PairsTradingEngine:
         strategy_returns = dollar_pnl / self.capital
         equity = self.capital + dollar_pnl.cumsum()
 
-        net_beta = (
-            held_a * beta_ratio_info["beta_a"] + held_b * beta_ratio_info["beta_b"]
-        ) / self.capital
+        net_beta = (held_a * beta_ratio_info["beta_a"] + held_b * beta_ratio_info["beta_b"]) / self.capital
 
         benchmark_returns = returns_benchmark
         benchmark_cum = np.exp(benchmark_returns.cumsum()) - 1.0
@@ -734,11 +717,7 @@ class PairsTradingEngine:
             half_life,
             self.stop_loss,
         )
-        if (
-            not blotter.empty
-            and np.isfinite(half_life)
-            and 5.0 <= half_life <= 60.0
-        ):
+        if not blotter.empty and np.isfinite(half_life) and 5.0 <= half_life <= 60.0:
             reverted_on_time = float((blotter["half_life_mult"] <= 1.5).mean())
         else:
             reverted_on_time = float("nan")
@@ -758,11 +737,13 @@ class PairsTradingEngine:
             "sizing_method": self.sizing_method,
             "data": closes,
             "benchmark_series": benchmark,
-            "log_prices": pd.DataFrame({
-                self.asset_a: log_a,
-                self.asset_b: log_b,
-                self.benchmark: log_benchmark,
-            }),
+            "log_prices": pd.DataFrame(
+                {
+                    self.asset_a: log_a,
+                    self.asset_b: log_b,
+                    self.benchmark: log_benchmark,
+                }
+            ),
             "spread": spread,
             "spread_mean": rolling_mean,
             "zscore": zscore,
@@ -1005,7 +986,9 @@ def _is_groq_model_not_found(exc: Exception) -> bool:
     if status_code != 404:
         return False
     message = str(exc).lower()
-    return "model" in message and ("not found" in message or "does not exist" in message or "model_not_found" in message)
+    return "model" in message and (
+        "not found" in message or "does not exist" in message or "model_not_found" in message
+    )
 
 
 def _get_groq_client(api_key: str):
