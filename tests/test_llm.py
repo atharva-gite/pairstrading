@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src import logic
+from src import llm
 from src.logic import (
     GROQ_MODEL_FALLBACK,
     GROQ_MODEL_PRIMARY,
@@ -20,7 +20,7 @@ from src.logic import (
 
 @pytest.fixture(autouse=True)
 def isolated_env(monkeypatch):
-    monkeypatch.setattr(logic, "_load_project_dotenv", lambda: None)
+    monkeypatch.setattr(llm, "_load_project_dotenv", lambda: None)
     for var in ("GROQ_API_KEY", "LLM_PROVIDER", "GROQ_MODEL"):
         monkeypatch.delenv(var, raising=False)
 
@@ -68,7 +68,7 @@ def fake_client(replies):
 def use_client(monkeypatch, replies):
     client, calls = fake_client(replies)
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
-    monkeypatch.setattr(logic, "GROQ_CLIENT_FACTORY", lambda api_key: client)
+    monkeypatch.setattr(llm, "GROQ_CLIENT_FACTORY", lambda api_key: client)
     return calls
 
 
