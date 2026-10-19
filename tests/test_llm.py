@@ -190,14 +190,29 @@ def test_model_override_from_env(monkeypatch):
     assert calls == [("groq", "llama-3.3-70b-versatile")]
 
 
-def test_rate_limit_falls_through_to_next_provider(monkeypatch):
+def test_rate_limit_tries_the_fallback_model_then_the_next_provider(monkeypatch):
     calls = use_providers(
         monkeypatch,
-        {"groq": [ProviderError("rate limit reached", status_code=429)], "gemini": ["from gemini"]},
+        {
+            "groq": [
+                ProviderError("rate limit reached", status_code=429),
+                ProviderError("rate limit reached", status_code=429),
+            ],
+            "gemini": ["from gemini"],
+        },
     )
     result = ask()
     assert result.ok and result.provider == "Google Gemini"
-    assert [name for name, _ in calls] == ["groq", "gemini"]
+    assert calls == [
+        ("groq", PROVIDERS["groq"].model),
+        ("groq", PROVIDERS["groq"].fallback_model),
+        ("gemini", PROVIDERS["gemini"].model),
+    ]
+
+
+def test_mistral_fallback_model_is_the_free_nemo_model():
+    assert PROVIDERS["mistral"].model == "mistral-small-latest"
+    assert PROVIDERS["mistral"].fallback_model == "open-mistral-nemo"
 
 
 def test_model_not_found_tries_fallback_model_first(monkeypatch):

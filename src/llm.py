@@ -58,7 +58,14 @@ PROVIDERS: dict[str, Provider] = {
         Provider(
             "cerebras", "Cerebras", "CEREBRAS_API_KEY", "https://api.cerebras.ai/v1", "gpt-oss-120b", "llama3.1-8b"
         ),
-        Provider("mistral", "Mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1", "mistral-small-latest"),
+        Provider(
+            "mistral",
+            "Mistral",
+            "MISTRAL_API_KEY",
+            "https://api.mistral.ai/v1",
+            "mistral-small-latest",
+            "open-mistral-nemo",
+        ),
         Provider(
             "openrouter",
             "OpenRouter",
@@ -85,21 +92,26 @@ LLM_CLIENT_FACTORY: Callable[..., Any] | None = None
 
 RESEARCH_SYSTEM = (
     "You are the research analyst on TETHER, a market-neutral pairs desk. "
-    "Answer only from ACTIVE_BOOK_CONTEXT_JSON. If a number is missing, say so. "
-    "Do not invent trades, p-values, or PnL. "
-    "A BROKEN tether is usually correlation without a tradable mean-reverting spread. "
-    "If half_life is above 60 days, do not treat on-time exits as success. "
-    "Be specific, concise, and use the actual pair and numbers from context."
+    "Answer only from ACTIVE_BOOK_CONTEXT_JSON. If a number is missing, say it is not in the book. "
+    "Do not invent trades, p-values, dates, or PnL, and do not give investment advice. "
+    "A BROKEN tether is correlation without a tradable mean-reverting spread. "
+    "If half_life is above 60 days, on-time exits are not evidence the relationship is tradable. "
+    "Write 2 short paragraphs. Every claim names the pair and cites the figure that supports it "
+    "(p-value, half-life in days, tether score, Sharpe, return, or a blotter row with its dates and PnL). "
+    "Percents to one decimal. No preamble and no restatement of the question."
 )
 
 DESK_BRIEFING_SYSTEM = (
     "You are the PM on TETHER. Write a briefing from ACTIVE_BOOK_CONTEXT_JSON only. "
-    "Return JSON with keys headline, verdict, drivers, risks. No markdown. "
-    "headline: one line. verdict: 3-5 sentences a trader can act on. "
-    "drivers: why the tether score and PnL look like this. "
-    "risks: what would invalidate the read. "
-    "If tether_state is BROKEN, lead with that. "
-    "If half_life > 60, say the OU clock is too slow to use on-time exits as evidence."
+    "Return JSON with keys headline, verdict, drivers, risks. No markdown and no code fence. "
+    "headline: one line naming the pair, the tether state, and the single most important number. "
+    "verdict: 3 or 4 sentences. Lead with BROKEN or a half-life above 60 days when either is true. "
+    "Include the tether score, the cointegration p-value, the half-life in days, and the book return "
+    "next to the pair buy-and-hold and the benchmark. "
+    "drivers: the two or three figures that explain the score and the PnL. "
+    "risks: the specific result that would invalidate the read (the out-of-sample state, a stop, "
+    "or a half-life too slow to trade). "
+    "Do not invent numbers and do not give investment advice."
 )
 
 TASK_SYSTEMS = {"briefing": DESK_BRIEFING_SYSTEM, "research": RESEARCH_SYSTEM}
@@ -289,7 +301,7 @@ def _call_provider(provider: Provider, api_key: str, input_messages: list[dict[s
         try:
             response = client.chat.completions.create(model=model, messages=input_messages, temperature=0.2)
         except Exception as exc:
-            if _is_model_not_found(exc) and i + 1 < len(models):
+            if i + 1 < len(models) and (_is_model_not_found(exc) or _is_transient(exc)):
                 continue
             return LLMResult(False, "", f"request failed: {_describe_error(exc)}", provider.label, model)
         content = response.choices[0].message.content
@@ -346,6 +358,12 @@ def _describe_error(exc: Exception) -> str:
     return message if len(message) <= 120 else message[:117] + "..."
 
 
+def _is_transient(exc: Exception) -> bool:
+    """Rate limits and provider outages are worth one try on the fallback model."""
+    code = _status_code(exc)
+    return code in (429, 500, 502, 503, 504)
+
+
 def _is_model_not_found(exc: Exception) -> bool:
     status_code = _status_code(exc)
     if status_code not in (400, 404):
@@ -356,6 +374,7 @@ def _is_model_not_found(exc: Exception) -> bool:
         or "does not exist" in message
         or "model_not_found" in message
         or "not a valid model" in message
+        or "invalid model" in message
         or "no endpoints" in message
     )
 

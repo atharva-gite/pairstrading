@@ -12,25 +12,29 @@ from src.llm import call_llm, json_safe
 
 SUMMARY_SYSTEM = (
     "You write the AI Report on TETHER, a market-neutral pairs-trading research desk. "
-    "The audience includes hiring managers who are not quants, so be formal and precise, and define a term "
-    "the first time you use it. Use only facts and numbers in VIEW_CONTEXT_JSON. If a figure is missing, omit it. "
-    "Write two short paragraphs, no headings, bullets, or markdown. "
-    "Paragraph one states the current position, the statistical evidence, and the most important number. "
-    "Paragraph two covers recent trades, how the book compares with holding both stocks and with the index, "
-    "and the main caveat (a failed relationship, a slow half-life, or a result that did not hold after the split). "
-    "Do not give investment advice and do not invent numbers."
+    "The reader may not be a quant, so name each statistic in plain words the first time, then give the number. "
+    "Use only VIEW_CONTEXT_JSON. If a figure is absent, leave it out. Never round a number that is not in the context, "
+    "never invent a trade, and never give investment advice. "
+    "Write exactly two paragraphs, no headings, bullets, or markdown. "
+    "Paragraph one: what is true right now, then the single most important number, then the evidence for it. "
+    "Paragraph two: the comparison the reader needs (against the other pairs, or against holding the stocks and the index) "
+    "and one caveat, stated as a fact from the context. "
+    "Prefer fewer claims that each carry a number over a general description."
 )
 
 VIEW_FOCUS = {
     "universe": (
-        "Summarize this sector scan: how many pairs were tested, how many survive the false-discovery (FDR) "
-        "correction, which pair looks strongest and why, and which pairs looked tied together in the discovery "
-        "period but came apart after the split date."
+        "Report this sector scan. State pairs tested, pairs still significant after the false-discovery correction "
+        "(FDR), and pairs that were tied before the split date and came apart after it. "
+        "Name the leading pair with its tether state, tether score, p-value, and half-life in days. "
+        "If a pair died after the split, name it. Do not rank pairs the context does not rank."
     ),
     "tape": (
-        "Describe what this pair is doing right now: whether the book is long, short or flat the spread, how "
-        "stretched the spread is (the z-score) against the entry, exit and stop bands, how the last few trades "
-        "ended, and how the book has done against simply holding both stocks or the index."
+        "Report this pair as of the context date. State the position (long the spread, short the spread, or flat), "
+        "how many trading days it has been held, and the z-score against the entry, exit, and stop bands. "
+        "A z-score is how many normal wiggles the gap is from its average. "
+        "Then the last trade: side, days held, how it ended, and its profit or loss. "
+        "Close with three returns side by side: the book, holding both stocks, and the benchmark, each as a percent."
     ),
 }
 
