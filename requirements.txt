@@ -4,7 +4,7 @@ numpy==2.5.1
 yfinance==1.5.2
 statsmodels==0.14.6
 plotly==6.9.0
-python-dotenv==1.2.3
+python-dotenv==1.2.4
 openai==3.35.1
 matplotlib==3.11.1
 pillow==12.3.0
