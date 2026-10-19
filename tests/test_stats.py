@@ -3,11 +3,13 @@ import pandas as pd
 import pytest
 
 from src.logic import (
+    MAX_TRADABLE_HALF_LIFE,
     PairsTradingEngine,
     apply_multiple_testing,
     build_signals,
     build_trade_blotter,
     calculate_half_life,
+    compute_tether_profile,
     pair_pvalue_matrix,
     rolling_cointegration_pvalues,
     rolling_ols_hedge_ratio,
@@ -54,6 +56,18 @@ def test_tether_from_prices_flags_too_few_observations():
     out = tether_from_prices(a, b)
     assert out["tether_state"] == "BROKEN"
     assert out["tether_reason"] == "too_few_obs"
+
+
+@pytest.mark.parametrize(
+    ("half_life", "state"),
+    [(40.0, "TETHERED"), (60.0, "TETHERED"), (70.0, "WEAK"), (114.0, "WEAK")],
+)
+def test_slow_half_life_can_never_be_tethered(half_life, state):
+    profile = compute_tether_profile(p_value=0.001, adf_p_value=0.001, half_life=half_life)
+    assert profile["tether_state"] == state
+    if half_life > MAX_TRADABLE_HALF_LIFE:
+        assert profile["tether_score"] >= 70
+        assert profile["tether_reason"] == "too_slow"
 
 
 def test_half_life_nan_when_spread_short_or_explosive():

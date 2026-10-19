@@ -46,6 +46,8 @@ SCREEN_COLUMNS = [
     "tether_died",
 ]
 
+MAX_TRADABLE_HALF_LIFE = 60.0
+
 LLM_PROVIDER_ENV = "LLM_PROVIDER"
 LLM_MODEL_ENV = "GROQ_MODEL"
 DEFAULT_LLM_PROVIDER = "groq"
@@ -312,7 +314,7 @@ def compute_tether_profile(
         reason = "no_cointegration"
     elif half_life is None or not np.isfinite(half_life) or half_life <= 0:
         reason = "no_half_life"
-    elif half_life > 60:
+    elif half_life > MAX_TRADABLE_HALF_LIFE:
         reason = "too_slow"
     elif half_life < 5:
         reason = "too_fast"
@@ -321,7 +323,8 @@ def compute_tether_profile(
     else:
         reason = "weak_evidence"
 
-    if score >= 70 and p_value < 0.05:
+    too_slow = half_life is not None and np.isfinite(half_life) and half_life > MAX_TRADABLE_HALF_LIFE
+    if score >= 70 and p_value < 0.05 and not too_slow:
         state = "TETHERED"
     elif score >= 45 and p_value < 0.10:
         state = "WEAK"
@@ -878,6 +881,7 @@ def build_book_context(result: dict) -> dict:
         "rolling_p_value_max": rolling_max,
         "desk_rules": {
             "tradable_half_life_days": [8, 40],
+            "max_tethered_half_life_days": MAX_TRADABLE_HALF_LIFE,
             "on_time_metric_valid_if_half_life_days": [5, 60],
             "cointegration_p_cutoff": 0.05,
         },
