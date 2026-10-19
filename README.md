@@ -1,5 +1,7 @@
 # TETHER
 
+[![CI](https://github.com/atharva-gite/pairstrading/actions/workflows/ci.yml/badge.svg)](https://github.com/atharva-gite/pairstrading/actions/workflows/ci.yml)
+
 Market-neutral pairs desk. You do not trade two stocks — you trade whether their **tether is still holding**.
 
 [![TETHER desk walkthrough](docs/assets/tether.gif)](docs/assets/tether.gif)
@@ -39,6 +41,16 @@ streamlit run app.py
 ```
 
 Copy `.env.example` to `.env` and set `GROQ_API_KEY` for desk briefings and Research. Never commit `.env`.
+
+## Develop
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+ruff check . && ruff format --check .
+pytest --cov
+```
+
+CI runs the same lint and tests on Python 3.12 and 3.14 for every push and pull request. Tests are offline (synthetic prices, mocked Groq), and the build fails if coverage of `src/` drops below the floor in `pyproject.toml`.
 
 Rebuild the GIF and PDF:
 
