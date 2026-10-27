@@ -25,6 +25,7 @@ from src.logic import (
 
 load_dotenv()
 
+
 TICKER_NAMES = {
     "AAPL": "Apple",
     "MSFT": "Microsoft",
@@ -265,8 +266,6 @@ def apply_chart_layout(fig: go.Figure, title: str, y_title: str) -> go.Figure:
     )
     return fig
 
-    return fig
-
 
 def ticker_label(ticker: str) -> str:
     name = TICKER_NAMES.get(ticker, ticker)
@@ -275,6 +274,21 @@ def ticker_label(ticker: str) -> str:
 
 def ticker_from_label(label: str) -> str:
     return label.split(" ")[0]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_market_prices(tickers: tuple[str, ...], start: str, end: str, _v: int = 3) -> pd.DataFrame:
+    return download_price_data(list(tickers), start, end)
+
+
+def load_pair_into_ticket() -> None:
+    """Callback: widget keys must be written before the sidebar selectboxes instantiate."""
+    chosen = st.session_state.get("screen_pair_choice")
+    if not chosen or "/" not in chosen:
+        return
+    chosen_a, chosen_b = chosen.split("/", 1)
+    st.session_state["asset_a"] = ticker_label(chosen_a)
+    st.session_state["asset_b"] = ticker_label(chosen_b)
 
 
 def fmt_pct(value: float) -> str:
@@ -634,49 +648,62 @@ if show_results and not st.session_state.get("book_context"):
 
 if run_button and asset_a != asset_b and start_date < end_date:
     with st.spinner("Estimating the tether and running the book..."):
-        engine = PairsTradingEngine(
-            asset_a=asset_a,
-            asset_b=asset_b,
-            benchmark=benchmark,
-            start=start_date.isoformat(),
-            end=end_date.isoformat(),
-            lookback=lookback,
-            entry_z=entry_z,
-            exit_z=exit_z,
-            stop_loss=stop_loss,
-            slippage=0.001,
-            commission=0.0005,
-            hedge_method=hedge_method,
-            capital=float(capital),
-            sizing_method=sizing_method,
-            walk_forward=walk_forward,
-            split_date=split_date.isoformat(),
-            charge_borrow=charge_borrow,
-            borrow_bps=float(borrow_bps),
-            max_leg_pct=max_leg_pct / 100.0,
-        )
-        result = engine.fetch().run_backtest()
-        st.session_state["cost_grid"] = cost_sensitivity(engine) if not result["data"].empty else None
+        try:
+            tickers = (asset_a, asset_b) if benchmark in {asset_a, asset_b} else (asset_a, asset_b, benchmark)
+            prices = load_market_prices(tickers, start_date.isoformat(), end_date.isoformat())
+            engine = PairsTradingEngine(
+                asset_a=asset_a,
+                asset_b=asset_b,
+                benchmark=benchmark,
+                start=start_date.isoformat(),
+                end=end_date.isoformat(),
+                lookback=lookback,
+                entry_z=entry_z,
+                exit_z=exit_z,
+                stop_loss=stop_loss,
+                slippage=0.001,
+                commission=0.0005,
+                hedge_method=hedge_method,
+                capital=float(capital),
+                sizing_method=sizing_method,
+                walk_forward=walk_forward,
+                split_date=split_date.isoformat(),
+                charge_borrow=charge_borrow,
+                borrow_bps=float(borrow_bps),
+                max_leg_pct=max_leg_pct / 100.0,
+            )
+            engine.data = prices
+            missing = [ticker for ticker in tickers if ticker not in prices.columns]
+            if missing:
+                raise RuntimeError(f"No usable prices for {', '.join(missing)}.")
+            engine.data = prices[[*tickers]].dropna()
+            if len(engine.data) < 40:
+                raise RuntimeError("Not enough overlapping prices for that ticket and window.")
+            result = engine.run_backtest()
+            st.session_state["cost_grid"] = cost_sensitivity(engine) if not result["data"].empty else None
+        except (RuntimeError, KeyError, ValueError, OSError) as exc:
+            st.error(f"Could not load prices for {asset_a}/{asset_b}: {exc}")
+            result = {"data": pd.DataFrame()}
+            st.session_state["cost_grid"] = None
 
-    st.session_state["latest_backtest"] = result
-    st.session_state["latest_backtest_metrics"] = result["metrics"]
-    st.session_state["book_context"] = build_book_context(result)
     st.session_state.ai_messages = []
-    if not result["data"].empty:
+    if result.get("data") is not None and not result["data"].empty:
+        st.session_state["latest_backtest"] = result
+        st.session_state["latest_backtest_metrics"] = result["metrics"]
+        st.session_state["book_context"] = build_book_context(result)
         with st.spinner("Writing the desk briefing from this book..."):
             st.session_state["desk_briefing"] = generate_desk_briefing(st.session_state["book_context"])
         refresh_summary("tape", build_tape_context(result, entry_z, exit_z, stop_loss))
-    else:
-        st.session_state["desk_briefing"] = None
-        st.session_state.get("summaries", {}).pop("tape", None)
-
-    if result["data"].empty:
-        st.error("No prices for that ticket and window.")
-        show_results = False
-        metrics = None
-    else:
         metrics = result["metrics"]
         show_results = True
+    else:
+        st.session_state["latest_backtest"] = None
+        st.session_state["latest_backtest_metrics"] = None
+        st.session_state["book_context"] = None
+        st.session_state["desk_briefing"] = None
+        st.session_state.get("summaries", {}).pop("tape", None)
+        show_results = False
+        metrics = None
 
 pair_name = f"{asset_a}/{asset_b}"
 if show_results:
@@ -712,12 +739,25 @@ with main_tabs[0]:
 
     if run_screen:
         with st.spinner(f"Scoring {sector} tethers..."):
-            sector_prices = download_price_data(SECTOR_UNIVERSES[sector], start_date.isoformat(), end_date.isoformat())
-            screen_table = screen_sector_pairs(
-                sector_prices,
-                p_value_threshold=float(p_threshold),
-                split_date=split_date.isoformat() if walk_forward else None,
-            )
+            try:
+                sector_prices = load_market_prices(
+                    tuple(SECTOR_UNIVERSES[sector]),
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                )
+            except (RuntimeError, KeyError, ValueError, OSError) as exc:
+                st.error(f"Could not load {sector} prices: {exc}")
+                screen_table = pd.DataFrame()
+            else:
+                if sector_prices.empty:
+                    st.error(f"Yahoo returned no prices for {sector} in that window.")
+                    screen_table = pd.DataFrame()
+                else:
+                    screen_table = screen_sector_pairs(
+                        sector_prices,
+                        p_value_threshold=float(p_threshold),
+                        split_date=split_date.isoformat() if walk_forward else None,
+                    )
         st.session_state["screen_table"] = screen_table
         st.session_state["screen_sector_used"] = sector
         if not screen_table.empty:
@@ -764,12 +804,8 @@ with main_tabs[0]:
             cols.extend(["oos_tether_state", "tether_died"])
         st.dataframe(display[[c for c in cols if c in display.columns]], width="stretch", hide_index=True)
         pair_options = screen_table["pair"].tolist()
-        chosen_pair = st.selectbox("Load into the ticket", pair_options, key="screen_pair_choice")
-        if st.button("Load pair"):
-            chosen_a, chosen_b = chosen_pair.split("/")
-            st.session_state["asset_a"] = ticker_label(chosen_a)
-            st.session_state["asset_b"] = ticker_label(chosen_b)
-            st.rerun()
+        st.selectbox("Load into the ticket", pair_options, key="screen_pair_choice")
+        st.button("Load pair", on_click=load_pair_into_ticket)
 
 with main_tabs[1]:
     if show_results:

@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
+from src.net import direct_outbound_network, loopback_proxy_active
 from src.stats import MAX_TRADABLE_HALF_LIFE
 
 
@@ -299,7 +300,8 @@ def _call_provider(provider: Provider, api_key: str, input_messages: list[dict[s
     client = _get_client(provider, api_key)
     for i, model in enumerate(models):
         try:
-            response = client.chat.completions.create(model=model, messages=input_messages, temperature=0.2)
+            with direct_outbound_network():
+                response = client.chat.completions.create(model=model, messages=input_messages, temperature=0.2)
         except Exception as exc:
             if i + 1 < len(models) and (_is_model_not_found(exc) or _is_transient(exc)):
                 continue
@@ -382,6 +384,15 @@ def _is_model_not_found(exc: Exception) -> bool:
 def _get_client(provider: Provider, api_key: str):
     if LLM_CLIENT_FACTORY is not None:
         return LLM_CLIENT_FACTORY(provider=provider, api_key=api_key)
-    from openai import OpenAI
+    from openai import DefaultHttpxClient, OpenAI
 
-    return OpenAI(api_key=api_key, base_url=provider.base_url, max_retries=1, timeout=45)
+    kwargs: dict[str, Any] = {
+        "api_key": api_key,
+        "base_url": provider.base_url,
+        "max_retries": 1,
+        "timeout": 45,
+    }
+    if loopback_proxy_active():
+        # httpx honors HTTPS_PROXY by default; Cursor's loopback proxy 403s Groq/Mistral.
+        kwargs["http_client"] = DefaultHttpxClient(trust_env=False, timeout=45)
+    return OpenAI(**kwargs)

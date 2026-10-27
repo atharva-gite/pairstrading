@@ -260,3 +260,89 @@ def test_borrow_reduces_pnl_when_short():
     cheap_pnl = cheap.run_backtest()["metrics"]["total_pnl"]
     rich_pnl = rich.run_backtest()["metrics"]["total_pnl"]
     assert rich_pnl <= cheap_pnl + 1e-6
+
+
+def test_download_keeps_tickers_that_have_prices(monkeypatch):
+    from src.engine import download_price_data
+
+    idx = pd.date_range("2020-01-01", periods=5)
+    close = pd.DataFrame({"AAA": [1.0, 2.0, 3.0, 4.0, 5.0], "BBB": [np.nan] * 5}, index=idx)
+    raw = pd.concat({"Close": close, "Open": close + 0.1}, axis=1)
+    monkeypatch.setattr("src.engine.yf.download", lambda *args, **kwargs: raw)
+
+    prices = download_price_data(["AAA", "BBB"], "2020-01-01", "2020-01-10")
+    assert list(prices.columns) == ["AAA"]
+    assert len(prices) == 5
+
+
+def test_download_falls_back_to_per_ticker_history(monkeypatch, tmp_path):
+    from src.engine import download_price_data
+
+    monkeypatch.setattr("src.engine.MARKET_CACHE", tmp_path / "missing.csv")
+    monkeypatch.setattr("src.engine.yf.download", lambda *args, **kwargs: pd.DataFrame())
+
+    class FakeTicker:
+        def __init__(self, name, session=None):
+            self.name = name
+
+        def history(self, **kwargs):
+            idx = pd.date_range("2020-01-01", periods=4)
+            return pd.DataFrame({"Close": [10.0, 11.0, 12.0, 13.0], "Open": [10.0] * 4}, index=idx)
+
+    monkeypatch.setattr("src.engine.yf.Ticker", FakeTicker)
+    prices = download_price_data(["KO", "PEP"], "2020-01-01", "2020-01-10")
+    assert list(prices.columns) == ["KO", "PEP"]
+    assert len(prices) == 4
+
+
+def test_download_uses_on_disk_cache_when_yahoo_is_down(monkeypatch, tmp_path):
+    from src.engine import download_price_data
+
+    idx = pd.date_range("2020-01-02", periods=5)
+    cache = pd.DataFrame({"KO": [50.0, 51.0, 52.0, 53.0, 54.0], "PEP": [80.0, 81.0, 82.0, 83.0, 84.0]}, index=idx)
+    path = tmp_path / "market_prices.csv"
+    cache.to_csv(path)
+    monkeypatch.setattr("src.engine.MARKET_CACHE", path)
+    monkeypatch.setattr("src.engine.yf.download", lambda *args, **kwargs: pd.DataFrame())
+
+    class EmptyTicker:
+        def __init__(self, name, session=None):
+            self.name = name
+
+        def history(self, **kwargs):
+            return pd.DataFrame()
+
+    monkeypatch.setattr("src.engine.yf.Ticker", EmptyTicker)
+    prices = download_price_data(["KO", "PEP"], "2020-01-01", "2020-01-10")
+    assert list(prices.columns) == ["KO", "PEP"]
+    assert len(prices) == 5
+
+
+def test_loopback_proxy_is_treated_as_broken():
+    from src.net import is_loopback_proxy
+
+    assert is_loopback_proxy("http://127.0.0.1:64097")
+    assert is_loopback_proxy("socks5://127.0.0.1:64096")
+    assert not is_loopback_proxy("http://proxy.corp.example:8080")
+
+
+def test_download_raises_when_yahoo_returns_nothing(monkeypatch, tmp_path):
+    from src.engine import download_price_data
+
+    monkeypatch.setattr("src.engine.MARKET_CACHE", tmp_path / "missing.csv")
+    monkeypatch.setattr("src.engine.yf.download", lambda *args, **kwargs: pd.DataFrame())
+
+    class EmptyTicker:
+        def __init__(self, name, session=None):
+            self.name = name
+
+        def history(self, **kwargs):
+            return pd.DataFrame()
+
+    monkeypatch.setattr("src.engine.yf.Ticker", EmptyTicker)
+    try:
+        download_price_data(["KO"], "2020-01-01", "2020-01-10")
+    except RuntimeError as exc:
+        assert "Could not load prices" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")

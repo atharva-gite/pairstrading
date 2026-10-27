@@ -12,6 +12,12 @@ def test_sidebar_slider_controls_are_defined_once_with_keys():
     assert content.count("key=") >= 4, "Each sidebar control should have a unique Streamlit key"
 
 
+def test_load_pair_uses_a_callback_instead_of_writing_widget_state_inline():
+    content = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    assert 'st.button("Load pair", on_click=load_pair_into_ticket)' in content
+    assert "st.session_state[\"asset_a\"] = ticker_label(chosen_a)" in content
+
+
 def test_app_renders_without_running_a_ticket():
     from streamlit.testing.v1 import AppTest
 

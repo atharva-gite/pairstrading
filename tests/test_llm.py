@@ -288,6 +288,51 @@ def test_custom_system_prompt_and_context_label(monkeypatch):
     assert captured[0][0]["content"].startswith("SYS\n\nVIEW_CONTEXT_JSON:")
 
 
+def _clear_proxy_env(monkeypatch):
+    from src.net import PROXY_ENV
+
+    for key in PROXY_ENV:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_openai_client_skips_cursor_loopback_proxy(monkeypatch):
+    captured: dict = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class FakeHttpClient:
+        def __init__(self, **kwargs):
+            captured["http_kwargs"] = kwargs
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:64097")
+    monkeypatch.setattr(llm, "LLM_CLIENT_FACTORY", None)
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+    monkeypatch.setattr("openai.DefaultHttpxClient", FakeHttpClient)
+
+    llm._get_client(PROVIDERS["groq"], "gsk-test")
+    assert captured["http_kwargs"]["trust_env"] is False
+    assert captured["base_url"] == PROVIDERS["groq"].base_url
+
+
+def test_openai_client_keeps_env_proxy_when_it_is_not_loopback(monkeypatch):
+    captured: dict = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.corp.example:8080")
+    monkeypatch.setattr(llm, "LLM_CLIENT_FACTORY", None)
+    monkeypatch.setattr("openai.OpenAI", FakeOpenAI)
+
+    llm._get_client(PROVIDERS["groq"], "gsk-test")
+    assert "http_client" not in captured
+
+
 def test_desk_briefing_reports_llm_error():
     briefing = generate_desk_briefing({"pair": "KO/PEP"})
     assert briefing["error"] and briefing["verdict"] == ""
